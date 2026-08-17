@@ -492,7 +492,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         echo "nvidia-nccl-cu${CUDA_MAJOR}==${NCCL_VERSION}" \
             > /tmp/nccl-override.txt && \
         export UV_OVERRIDE=/tmp/nccl-override.txt && \
-        uv pip install --system "nvidia-nccl-cu${CUDA_MAJOR}==${NCCL_VERSION}"; \
+        uv pip install "nvidia-nccl-cu${CUDA_MAJOR}==${NCCL_VERSION}"; \
     fi && \
     export TORCH_CUDA_ARCH_LIST='9.0a 10.0a' && \
     /tmp/install_python_libraries.sh \
