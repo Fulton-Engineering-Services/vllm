@@ -561,6 +561,15 @@ ENV VLLM_TARGET_DEVICE=${vllm_target_device}
 # Skip adding +precompiled suffix to version (preserves git-derived version)
 ENV VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX=1
 
+# The fork is built from a BRANCH git context (cuda13.3-aarch64-gb10), not a
+# tag ref, so setuptools_scm's `git describe` has no parseable version tag and
+# falls back to the branch name, which its tag_regex rejects ("Can't parse
+# version from tag 'cuda13.3-aarch64-gb10'"). Pin the base version so
+# get_vllm_version() still appends the +cu133 suffix via the normal CUDA path
+# below (VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX=1 keeps it from becoming
+# +precompiled instead).
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.27.1
+
 # Use existing torch for nightly builds
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
