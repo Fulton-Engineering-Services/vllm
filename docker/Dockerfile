@@ -22,9 +22,10 @@
 #   docker buildx bake -f docker/docker-bake.hcl -f docker/versions.json
 # =============================================================================
 
-ARG CUDA_VERSION=13.0.3
+ARG CUDA_VERSION=13.3.1
+ARG FLASHINFER_CUDA_INDEX_VERSION=13.0
 ARG PYTHON_VERSION=3.12
-ARG UBUNTU_VERSION=22.04
+ARG UBUNTU_VERSION=24.04
 # DeepEPv2 requires NCCL >= 2.30.4 (GIN backend).
 # This version is used for CUDA 12+ builds to keep the DeepEP build and
 # runtime NCCL versions compatible.
@@ -41,7 +42,7 @@ ARG NCCL_VERSION=2.30.7
 # compatibility with other Linux OSes. The main reason for this is that the
 # glibc version is baked into the distro, and binaries built with one glibc
 # version are not backwards compatible with OSes that use an earlier version.
-ARG BUILD_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
+ARG BUILD_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04
 # Using cuda base image with minimal dependencies necessary for JIT compilation (FlashInfer, DeepGEMM, EP kernels)
 ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION}
 
@@ -267,7 +268,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     else \
         uv pip install --python /opt/venv/bin/python3 -r requirements/cuda.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url https://fulton-engineering-services.github.io/dgx-spark-wheels/simple/; \
     fi
 
 # Track PyTorch lib versions used during build and match in downstream instances.
@@ -385,7 +386,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     else \
         echo "Installing build requirements..." \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/build/cuda.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url https://fulton-engineering-services.github.io/dgx-spark-wheels/simple/; \
     fi
 
 WORKDIR /workspace
@@ -535,7 +536,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     else \
         echo "Installing build requirements..." \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/build/cuda.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url https://fulton-engineering-services.github.io/dgx-spark-wheels/simple/; \
     fi
 
 WORKDIR /workspace
@@ -646,7 +647,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     else \
         echo "Installing dev requirements..." \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/dev.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url https://fulton-engineering-services.github.io/dgx-spark-wheels/simple/; \
     fi
 
 #################### DEV IMAGE ####################
@@ -805,16 +806,17 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         sed -i 's/^humming-kernels\[cu13\]/humming-kernels[cu12]/' /tmp/requirements-cuda.txt; \
     fi && \
     uv pip install --system -r /tmp/requirements-cuda.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') && \
+        --extra-index-url https://fulton-engineering-services.github.io/dgx-spark-wheels/simple/ && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
 
 # Install FlashInfer JIT cache (requires CUDA-version-specific index URL)
 # https://docs.flashinfer.ai/installation.html
 # From versions.json: .flashinfer.version
+ARG FLASHINFER_CUDA_INDEX_VERSION
 ARG FLASHINFER_VERSION=0.6.16.post3
 RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
-        --index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+        --index-url https://flashinfer.ai/whl/cu$(echo ${FLASHINFER_CUDA_INDEX_VERSION} | tr -d '.')
 
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
@@ -885,7 +887,7 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
     else \
         echo "Installing vLLM..." \
         && uv pip install --system dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url https://fulton-engineering-services.github.io/dgx-spark-wheels/simple/; \
     fi
 
 RUN --mount=type=cache,target=/opt/uv/cache \
@@ -902,7 +904,7 @@ COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-w
 RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
     --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system ep_kernels/dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+        --extra-index-url https://fulton-engineering-services.github.io/dgx-spark-wheels/simple/
 
 # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
 # return to /usr/local/nvidia in 13.0 to allow container providers to mount drivers
@@ -967,10 +969,10 @@ RUN --mount=type=cache,id=uv-v027-ubuntu2204,target=/opt/uv/cache \
             && if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
                 echo "Recompiling test requirements for arm64..." \
                 && uv pip compile requirements/test/cuda.in -o requirements/test/cuda.txt --index-strategy unsafe-best-match \
-                --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+                --extra-index-url https://fulton-engineering-services.github.io/dgx-spark-wheels/simple/; \
             fi \
             && uv pip install --system -r requirements/dev.txt \
-            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+            --extra-index-url https://fulton-engineering-services.github.io/dgx-spark-wheels/simple/; \
         fi \
         && if [ "$TARGETPLATFORM" != "linux/arm64" ]; then \
             python3 -c "from arctic_inference.suffix_decoding import _C"; \
