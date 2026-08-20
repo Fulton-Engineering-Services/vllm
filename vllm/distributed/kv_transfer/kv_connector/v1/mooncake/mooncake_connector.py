@@ -1675,8 +1675,14 @@ class MooncakeConnectorWorker:
                 )
                 continue
             if isinstance(layer_spec, MambaSpec):
-                conv, _ = cache_or_caches
-                cache_list = [conv]
+                # GDN-hybrid: register the CONV slices only (SSM state is not
+                # registered, matching the original conv,-only semantics).
+                # DS layout may present >2 entries (Q/K/V split + ssm), so
+                # unpack "conv group" = all-but-last rather than hard tuple-2.
+                if isinstance(cache_or_caches, (list, tuple)) and len(cache_or_caches) > 1:
+                    cache_list = list(cache_or_caches[:-1])
+                else:
+                    cache_list = [cache_or_caches]
             else:
                 # K and V are packed into one blocks-first tensor per layer,
                 # so each layer registers as a single region.
