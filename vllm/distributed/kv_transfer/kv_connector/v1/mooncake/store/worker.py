@@ -1387,25 +1387,6 @@ class MooncakeStoreWorker:
                 )
             ]
         self._kv_cache_groups: list[KVCacheGroupSpec] = groups
-
-    def _alloc_staging_buffer(self) -> None:
-        size = self._staging_buffer_size_mb * 1024 * 1024
-        self._staging_buf = torch.empty(size, dtype=torch.uint8, pin_memory=True)
-        self._staging_base = self._staging_buf.data_ptr()
-        self._staging_size = size
-        ret = self.store.register_buffer(self._staging_base, self._staging_size)
-        if ret != 0:
-            raise RuntimeError(
-                f"Failed to register Mooncake host_staging buffer "
-                f"({self._staging_buffer_size_mb} MiB at {self._staging_base:#x}) "
-                f"with the store: ret={ret}"
-            )
-        logger.info(
-            "Mooncake host_staging: registered %d MiB pinned arena at %#x",
-            self._staging_buffer_size_mb,
-            self._staging_base,
-        )
-        spec_cfg = getattr(vllm_config, "speculative_config", None)
         use_eagle = bool(
             spec_cfg.use_eagle()
             if spec_cfg is not None and callable(getattr(spec_cfg, "use_eagle", None))
@@ -1596,7 +1577,22 @@ class MooncakeStoreWorker:
         )
 
         if self.host_staging and self.kv_role in ["kv_producer", "kv_both"]:
-            self._alloc_staging_buffer()
+            size = self._staging_buffer_size_mb * 1024 * 1024
+            self._staging_buf = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+            self._staging_base = self._staging_buf.data_ptr()
+            self._staging_size = size
+            ret = self.store.register_buffer(self._staging_base, self._staging_size)
+            if ret != 0:
+                logger.error(
+                    "Failed to register host_staging buffer "
+                    "(%d MiB at %#x) with the store: ret=%d",
+                    self._staging_buffer_size_mb, self._staging_base, ret,
+                )
+            else:
+                logger.info(
+                    "Mooncake host_staging: registered %d MiB pinned arena at %#x",
+                    self._staging_buffer_size_mb, self._staging_base,
+                )
 
         for db in self.token_dbs:
             db.set_kv_caches_base_addr(addrs)
