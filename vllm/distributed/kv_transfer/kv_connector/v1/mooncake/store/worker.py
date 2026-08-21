@@ -1387,6 +1387,7 @@ class MooncakeStoreWorker:
                 )
             ]
         self._kv_cache_groups: list[KVCacheGroupSpec] = groups
+        spec_cfg = getattr(vllm_config, "speculative_config", None)
         use_eagle = bool(
             spec_cfg.use_eagle()
             if spec_cfg is not None and callable(getattr(spec_cfg, "use_eagle", None))
