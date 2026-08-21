@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
 import logging
@@ -70,6 +69,7 @@ ReqId = str
 
 TransferId = str
 
+@dataclass(frozen=True)
 class TransferRegion:
     layer_name: str
     layer_index: int
@@ -111,6 +111,7 @@ class MooncakeXferResponse(
     err_reqs: list[ReqId] | None = None
     err_msg: str | None = None
 
+@dataclass
 class PullReqMeta:
     d_req_id: ReqId
     transfer_id: TransferId
@@ -126,6 +127,7 @@ class PullReqMeta:
     # Only populated when host_staging is enabled.
     staging_slots: dict[int, tuple[int, list[int]]] | None = None
 
+@dataclass
 class SendBlockMeta:
     p_req_id: ReqId
     transfer_id: TransferId

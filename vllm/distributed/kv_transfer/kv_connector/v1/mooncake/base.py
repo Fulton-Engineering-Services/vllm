@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
 import logging
@@ -69,6 +68,7 @@ logger = init_logger(__name__)
 from ._protocol import MooncakeConnectorMetadata
 from .scheduler import MooncakeConnectorScheduler
 from .worker import MooncakeConnectorWorker
+
 
 class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
