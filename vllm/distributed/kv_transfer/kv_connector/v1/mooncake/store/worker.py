@@ -463,6 +463,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
         enable_kv_event: bool = False,
         replicate_config: Any = None,
         record_operation: Callable[..., None] | None = None,
+        host_staging: bool = False,
+        staging_buf: torch.Tensor | None = None,
+        staging_base: int = 0,
+        staging_size: int = 0,
     ):
         super().__init__(
             store,
@@ -486,6 +490,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
         self._skip_store_requests: set[str] = set()
+
+        self._host_staging = host_staging
+        self._staging_buf = staging_buf
+        self._staging_base = staging_base
+        self._staging_size = staging_size
 
         # Per-request high-water mark of tokens actually persisted; the next
         # batch resumes here, so pressure-skipped or failed ranges are retried.
@@ -690,6 +699,68 @@ class KVCacheStoreSendingThread(KVTransferThread):
             )
         return True
 
+    def _staged_put_from_multi_buffers(
+        self, keys, addrs, sizes
+    ):
+        """Put KV data through a pinned host staging buffer.
+
+        On GB10 / unified-memory GPUDirect-incapable hardware,
+        ibv_reg_mr() on CUDA VAs fails with EFAULT. The pinned
+        staging buffer is registered with the TransferEngine
+        instead, and a D2H copy precedes the RDMA write.
+        """
+        import cupy as cp
+
+        buf_base = self._staging_base
+        buf_size = self._staging_size
+        all_results: list[int] = []
+        i = 0
+
+        while i < len(keys):
+            offset = 0
+            batch_idxs: list[int] = []
+            staging_addrs: list[list[int]] = []
+            staging_sizes: list[list[int]] = []
+
+            while i < len(keys):
+                key_total = sum(sizes[i])
+                if offset + key_total > buf_size and batch_idxs:
+                    break
+                if key_total > buf_size:
+                    logger.error(
+                        "Key %s too large (%d) for staging buffer (%d)",
+                        keys[i], key_total, buf_size,
+                    )
+                    all_results.append(-1)
+                    i += 1
+                    continue
+                key_staging: list[int] = []
+                for j, seg_size in enumerate(sizes[i]):
+                    dst_ptr = buf_base + offset
+                    key_staging.append(dst_ptr)
+                    src_ptr = addrs[i][j]
+                    src_mem = cp.cuda.UnownedMemory(src_ptr, seg_size, None)
+                    src_mp = cp.cuda.MemoryPointer(src_mem, 0)
+                    dst_mem = cp.cuda.UnownedMemory(dst_ptr, seg_size, None)
+                    dst_mp = cp.cuda.MemoryPointer(dst_mem, 0)
+                    dst_mp.copy_from_device_async(src_mp, seg_size)
+                    offset += seg_size
+                batch_idxs.append(i)
+                staging_addrs.append(key_staging)
+                staging_sizes.append(sizes[i])
+                i += 1
+
+            cp.cuda.Device().synchronize()
+
+            batch_keys = [keys[idx] for idx in batch_idxs]
+            results = self.store.batch_put_from_multi_buffers(
+                batch_keys, staging_addrs, staging_sizes,
+                self.replicate_config,
+            )
+            all_results.extend(results)
+
+        return all_results
+
     def _handle_request(self, req_meta: ReqMeta):
         # Cache hits are always a multiple of ``lcm_block_size`` tokens, which
         # is also ``store_mask``'s precondition.
@@ -861,12 +932,17 @@ class KVCacheStoreSendingThread(KVTransferThread):
             batch_bytes = _sum_batch_bytes(sizes)
             put_start = time.perf_counter()
             try:
-                res = self.store.batch_put_from_multi_buffers(
-                    keys,
-                    addrs,
-                    sizes,
-                    self.replicate_config,
-                )
+                if self._host_staging and self._staging_buf is not None:
+                    res = self._staged_put_from_multi_buffers(
+                        keys, addrs, sizes
+                    )
+                else:
+                    res = self.store.batch_put_from_multi_buffers(
+                        keys,
+                        addrs,
+                        sizes,
+                        self.replicate_config,
+                    )
                 failed = [i for i, v in enumerate(res) if v < 0]
                 self._record_operation(
                     "save_put",
@@ -1266,6 +1342,19 @@ class MooncakeStoreWorker:
         # Pool of load-receive threads
         self.kv_recv_threads: list[KVCacheStoreRecvingThread] = []
         self.num_recv_threads = max(1, envs.VLLM_MOONCAKE_LOAD_RECV_THREADS)
+        self.host_staging = bool(
+            vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+                "host_staging", False
+            )
+        )
+        self._staging_buffer_size_mb = int(
+            vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+                "staging_buffer_size_mb", 256
+            )
+        )
+        self._staging_buf: torch.Tensor | None = None
+        self._staging_base: int = 0
+        self._staging_size: int = 0
         self.recv_request_queue: queue.Queue[ReqMeta] = queue.Queue()
         self.finished_store_req: set[str] = set()
         self._kv_connector_stats_lock = threading.Lock()
@@ -1298,6 +1387,24 @@ class MooncakeStoreWorker:
                 )
             ]
         self._kv_cache_groups: list[KVCacheGroupSpec] = groups
+
+    def _alloc_staging_buffer(self) -> None:
+        size = self._staging_buffer_size_mb * 1024 * 1024
+        self._staging_buf = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+        self._staging_base = self._staging_buf.data_ptr()
+        self._staging_size = size
+        ret = self.store.register_buffer(self._staging_base, self._staging_size)
+        if ret != 0:
+            raise RuntimeError(
+                f"Failed to register Mooncake host_staging buffer "
+                f"({self._staging_buffer_size_mb} MiB at {self._staging_base:#x}) "
+                f"with the store: ret={ret}"
+            )
+        logger.info(
+            "Mooncake host_staging: registered %d MiB pinned arena at %#x",
+            self._staging_buffer_size_mb,
+            self._staging_base,
+        )
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         use_eagle = bool(
             spec_cfg.use_eagle()
@@ -1488,6 +1595,9 @@ class MooncakeStoreWorker:
             self.num_blocks,
         )
 
+        if self.host_staging and self.kv_role in ["kv_producer", "kv_both"]:
+            self._alloc_staging_buffer()
+
         for db in self.token_dbs:
             db.set_kv_caches_base_addr(addrs)
             db.set_block_len(block_lens)
@@ -1507,6 +1617,10 @@ class MooncakeStoreWorker:
                 self.enable_kv_events,
                 self.store_replicate_config,
                 record_operation=self._record_kv_connector_operation,
+                host_staging=self.host_staging,
+                staging_buf=self._staging_buf,
+                staging_base=self._staging_base,
+                staging_size=self._staging_size,
             )
             self.kv_send_thread.start()
 
