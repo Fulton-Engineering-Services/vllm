@@ -72,7 +72,7 @@ except ImportError:
 
 logger = init_logger(__name__)
 
-from ._protocol import PullReqMeta, TransferRegion
+from ._protocol import PullReqMeta, ReqId, TransferRegion
 
 from ._transfer_planning import _expand_transfer_regions
 

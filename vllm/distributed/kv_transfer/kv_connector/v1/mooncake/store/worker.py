@@ -1194,6 +1194,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             record_operation=record_operation,
             request_queue=request_queue,
         )
+        self._host_staging = host_staging
         # _invalid_block_ids can be access by both the Worker and RecvingThread
         self._invalid_block_ids_lock = threading.Lock()
         self._invalid_block_ids: set[int] = set()
@@ -1206,7 +1207,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             )
         )
         self.coord = coord
-        self._host_staging = host_staging
         self._get_pool = staging_get_pool
 
     def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
