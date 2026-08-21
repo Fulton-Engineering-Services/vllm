@@ -67,9 +67,9 @@ from vllm.v1.worker.utils import select_common_block_size
 logger = init_logger(__name__)
 
 from ._protocol import (
-    MooncakeXferMetadata, MooncakeXferResponse,
+    MooncakeConnectorMetadata, MooncakeXferMetadata, MooncakeXferResponse,
     MooncakeXferResponseStatus, PullReqMeta, ReqId, SendBlockMeta,
-    TransferId, group_concurrent_contiguous,
+    TransferId, TransferRegion, group_concurrent_contiguous,
     get_mooncake_bootstrap_addr,
 )
 

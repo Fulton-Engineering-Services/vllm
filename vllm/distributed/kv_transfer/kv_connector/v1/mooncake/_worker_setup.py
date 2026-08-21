@@ -66,7 +66,7 @@ from vllm.v1.worker.utils import select_common_block_size
 
 logger = init_logger(__name__)
 
-from ._protocol import ReqId, TransferId, _get_tensor_dense_flag
+from ._protocol import ReqId, TransferId, TransferRegion, _get_tensor_dense_flag
 
 from ._transfer_planning import _expand_transfer_regions
 

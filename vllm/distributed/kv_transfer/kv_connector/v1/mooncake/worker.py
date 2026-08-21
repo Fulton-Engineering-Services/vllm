@@ -74,7 +74,7 @@ logger = init_logger(__name__)
 
 from ._protocol import (
     _async_loop, get_mooncake_bootstrap_addr,
-    should_launch_bootstrap_server, MooncakeXferMetadata,
+    should_launch_bootstrap_server, EngineId, MooncakeXferMetadata,
     MooncakeXferResponse, SendBlockMeta, TransferId, ReqId,
 )
 
