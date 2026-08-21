@@ -327,9 +327,14 @@ class _StagingSlotPool:
     def slots(self) -> list[dict[str, Any]]:
         return self._slots
 
-    def claim(self) -> int:
-        """Block until a free slot is available; return slot index."""
-        return self._free.get()
+    def claim(self, timeout: float = 30.0) -> int:
+        """Block until a free slot is available; return slot index.
+
+        Raises ``queue.Empty`` if no slot becomes free within *timeout*
+        seconds, so the caller can fail the chunk rather than deadlocking
+        when a store RPC hangs with all slots claimed.
+        """
+        return self._free.get(timeout=timeout)
 
     def release(self, idx: int) -> None:
         """Return a slot to the free pool."""
@@ -891,7 +896,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
     ) -> tuple[list[int], list[int]]:
         pool = self._put_pool
         assert pool is not None
-        slot_idx = pool.claim()
+        try:
+            slot_idx = pool.claim()
+        except queue.Empty:
+            return chunk_idxs, [-1] * len(chunk_idxs)
         slot = pool.slots[slot_idx]
 
         try:
@@ -1257,7 +1265,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         try:
             for future in futures:
                 chunk_idxs, chunk_results, slot_idx = future.result()
-                slots_used.add(slot_idx)
+                if slot_idx >= 0:
+                    slots_used.add(slot_idx)
                 for ci, cr in zip(chunk_idxs, chunk_results, strict=True):
                     result_map[ci] = [cr]
         except Exception:
@@ -1280,7 +1289,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
     ) -> tuple[list[int], list[int], int]:
         pool = self._get_pool
         assert pool is not None
-        slot_idx = pool.claim()
+        try:
+            slot_idx = pool.claim()
+        except queue.Empty:
+            return chunk_idxs, [-1] * len(chunk_idxs), -1
         slot = pool.slots[slot_idx]
 
         try:
