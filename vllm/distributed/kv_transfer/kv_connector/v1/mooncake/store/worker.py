@@ -1708,14 +1708,16 @@ class MooncakeStoreWorker:
                 "put",
             )
 
-        if self.kv_role in ("kv_consumer", "kv_both"):
-            self._staging_get_pool = _StagingSlotPool(
-                num_slots,
-                slot_size_bytes,
-                self.store,
-                None,
-                "get",
-            )
+        # Get pool is needed on every host_staging role: kv_producer also
+        # runs recv threads for its own prefix-cache loads from the store,
+        # and direct GPU-VA batch_get fails on GB10 (ibv_reg_mr -> EFAULT).
+        self._staging_get_pool = _StagingSlotPool(
+            num_slots,
+            slot_size_bytes,
+            self.store,
+            None,
+            "get",
+        )
 
         spec_cfg = getattr(self._vllm_config, "speculative_config", None)
         use_eagle = bool(
