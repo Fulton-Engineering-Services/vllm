@@ -121,9 +121,12 @@ class MultiKVConnectorPromMetrics(KVConnectorPromMetrics):
             # Only children that implement build_prom_metrics() register.
             # Plain MooncakeConnector has no hook — silently skip instead of
             # asserting, so a mixed child-set (e.g. MooncakeConnector +
-            # MooncakeStoreConnector) does not crash the P/D disagg chain.
+            # MooncakeStoreConnector) does not crash the APIServer's
+            # output_handler on a first disagg transfer.
             if connector_id in self._prom_metrics:
-                self._prom_metrics[connector_id].observe(stats_data["data"], engine_idx)
+                self._prom_metrics[connector_id].observe(
+                    stats_data["data"], engine_idx
+                )
 
 
 class MultiConnector(KVConnectorBase_V1, SupportsHMA):
