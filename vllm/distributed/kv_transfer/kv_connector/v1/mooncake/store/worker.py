@@ -1015,6 +1015,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         disk_offload_buffer_budget_bytes: int | None = None,
         record_operation: Callable[..., None] | None = None,
         request_queue: queue.Queue[Any] | None = None,
+        host_staging: bool = False,
+        staging_buf: torch.Tensor | None = None,
+        staging_base: int = 0,
+        staging_size: int = 0,
     ):
         super().__init__(
             store,
@@ -1026,6 +1030,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             record_operation=record_operation,
             request_queue=request_queue,
         )
+        self._host_staging = host_staging
+        self._staging_buf = staging_buf
+        self._staging_base = staging_base
+        self._staging_size = staging_size
         # _invalid_block_ids can be access by both the Worker and RecvingThread
         self._invalid_block_ids_lock = threading.Lock()
         self._invalid_block_ids: set[int] = set()
@@ -1048,6 +1056,77 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             invalid_block_ids = self._invalid_block_ids.copy()
             self._invalid_block_ids.clear()
         return invalid_block_ids
+
+    def _staged_batch_get_into_multi_buffers(
+        self, batch_keys, batch_addrs, batch_sizes
+    ):
+        """Get KV data from store into a staging buffer, then H2D to GPU.
+
+        On GB10 unified memory, ibv_reg_mr(GPU_VA) fails with EFAULT,
+        so the destination addresses for BatchGet must be host DRAM.
+        The staging buffer is RDMA-registered and holds the data
+        while cudaMemcpy moves it to the GPU KV cache.
+        """
+        import cupy as cp
+
+        buf_base = self._staging_base
+        buf_size = self._staging_size
+        all_results: list[int] = []
+        i = 0
+
+        while i < len(batch_keys):
+            offset = 0
+            staging_keys: list[str] = []
+            staging_addrs: list[list[int]] = []
+            staging_sizes: list[list[int]] = []
+            gpu_addrs: list[list[int]] = []
+            gpu_sizes: list[list[int]] = []
+
+            while i < len(batch_keys):
+                key_total = sum(batch_sizes[i])
+                if offset + key_total > buf_size and staging_keys:
+                    break
+                if key_total > buf_size:
+                    logger.error(
+                        "GET key %s too large (%d) for staging (%d)",
+                        batch_keys[i], key_total, buf_size,
+                    )
+                    all_results.append(-1)
+                    i += 1
+                    continue
+                staging_key_addrs: list[int] = []
+                for j, seg_size in enumerate(batch_sizes[i]):
+                    staging_key_addrs.append(buf_base + offset)
+                    offset += seg_size
+                staging_keys.append(batch_keys[i])
+                staging_addrs.append(staging_key_addrs)
+                staging_sizes.append(batch_sizes[i])
+                gpu_addrs.append(batch_addrs[i])
+                gpu_sizes.append(batch_sizes[i])
+                i += 1
+
+            results = self.store.batch_get_into_multi_buffers(
+                staging_keys, staging_addrs, staging_sizes
+            )
+            all_results.extend(results)
+
+            for ki, (res_code, dst_addrs, dst_sizes, src_addrs) in enumerate(
+                zip(results, gpu_addrs, gpu_sizes, staging_addrs, strict=True)
+            ):
+                if res_code < 0:
+                    continue
+                for seg_idx, seg_size in enumerate(dst_sizes):
+                    src_ptr = staging_addrs[ki][seg_idx]
+                    dst_ptr = dst_addrs[seg_idx]
+                    src_mem = cp.cuda.UnownedMemory(src_ptr, seg_size, None)
+                    dst_mem = cp.cuda.UnownedMemory(dst_ptr, seg_size, None)
+                    dst_mp = cp.cuda.MemoryPointer(dst_mem, 0)
+                    src_mp = cp.cuda.MemoryPointer(src_mem, 0)
+                    dst_mp.copy_from_device_async(src_mp, seg_size)
+
+            cp.cuda.Device().synchronize()
+
+        return all_results
 
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
@@ -1150,9 +1229,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     tiers_by_key = _get_replica_tiers_by_key(self.store, batch_keys)
                 # Reset so the recorded RPC duration excludes tier lookup.
                 load_get_start = time.perf_counter()
-                res = self.store.batch_get_into_multi_buffers(
-                    batch_keys, batch_addrs, batch_sizes
-                )
+                if self._host_staging and self._staging_buf is not None:
+                    res = self._staged_batch_get_into_multi_buffers(
+                        batch_keys, batch_addrs, batch_sizes
+                    )
+                else:
+                    res = self.store.batch_get_into_multi_buffers(
+                        batch_keys, batch_addrs, batch_sizes
+                    )
                 if tiers_by_key is not None:
                     _log_mooncake_load_tier_summary(
                         req_id, batch_keys, res, tiers_by_key
@@ -1355,6 +1439,9 @@ class MooncakeStoreWorker:
         self._staging_buf: torch.Tensor | None = None
         self._staging_base: int = 0
         self._staging_size: int = 0
+        self._recv_staging_buf: torch.Tensor | None = None
+        self._recv_staging_base: int = 0
+        self._recv_staging_size: int = 0
         self.recv_request_queue: queue.Queue[ReqMeta] = queue.Queue()
         self.finished_store_req: set[str] = set()
         self._kv_connector_stats_lock = threading.Lock()
@@ -1595,6 +1682,28 @@ class MooncakeStoreWorker:
                     self._staging_buffer_size_mb, self._staging_base,
                 )
 
+        if self.host_staging:
+            size = self._staging_buffer_size_mb * 1024 * 1024
+            self._recv_staging_buf = torch.empty(
+                size, dtype=torch.uint8, pin_memory=True
+            )
+            self._recv_staging_base = self._recv_staging_buf.data_ptr()
+            self._recv_staging_size = size
+            ret = self.store.register_buffer(
+                self._recv_staging_base, self._recv_staging_size
+            )
+            if ret != 0:
+                logger.error(
+                    "Failed to register recv staging buffer "
+                    "(%d MiB at %#x) with the store: ret=%d",
+                    self._staging_buffer_size_mb, self._recv_staging_base, ret,
+                )
+            else:
+                logger.info(
+                    "Mooncake host_staging: registered %d MiB recv arena at %#x",
+                    self._staging_buffer_size_mb, self._recv_staging_base,
+                )
+
         for db in self.token_dbs:
             db.set_kv_caches_base_addr(addrs)
             db.set_block_len(block_lens)
@@ -1635,6 +1744,10 @@ class MooncakeStoreWorker:
                 disk_offload_buffer_budget_bytes=self.disk_offload_buffer_budget_bytes,
                 record_operation=self._record_kv_connector_operation,
                 request_queue=self.recv_request_queue,
+                host_staging=self.host_staging,
+                staging_buf=self._recv_staging_buf,
+                staging_base=self._recv_staging_base,
+                staging_size=self._recv_staging_size,
             )
             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
             recv_thread.start()
