@@ -335,9 +335,9 @@ class _StagingSlotPool:
         """Return a slot to the free pool."""
         self._free.put(idx)
 
-    def submit(self, fn: Callable[[], _T]) -> Future[_T]:
+    def submit(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> Future[_T]:
         """Submit a callable to the pool executor. Returns a Future."""
-        return self._executor.submit(fn)
+        return self._executor.submit(fn, *args, **kwargs)
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False)
@@ -1208,6 +1208,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         )
         self.coord = coord
         self._get_pool = staging_get_pool
+        self._last_get_slots: set[int] = set()
 
     def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
         with self._invalid_block_ids_lock:
@@ -1245,16 +1246,18 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             )
             result_map[idx] = [-1]
 
-        futures: list[Future[tuple[list[int], list[int]]]] = []
+        futures: list[Future[tuple[list[int], list[int], int]]] = []
         for chunk in chunks:
             future = pool.submit(
                 self._get_chunk, keys, addrs, sizes, chunk,
             )
             futures.append(future)
 
+        slots_used: set[int] = set()
         try:
             for future in futures:
-                chunk_idxs, chunk_results = future.result()
+                chunk_idxs, chunk_results, slot_idx = future.result()
+                slots_used.add(slot_idx)
                 for ci, cr in zip(chunk_idxs, chunk_results, strict=True):
                     result_map[ci] = [cr]
         except Exception:
@@ -1265,6 +1268,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     pass
             raise
 
+        self._last_get_slots = slots_used
         return [result_map[i][0] for i in range(len(keys))]
 
     def _get_chunk(
@@ -1273,7 +1277,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         addrs: list[list[int]],
         sizes: list[list[int]],
         chunk_idxs: list[int],
-    ) -> tuple[list[int], list[int]]:
+    ) -> tuple[list[int], list[int], int]:
         pool = self._get_pool
         assert pool is not None
         slot_idx = pool.claim()
@@ -1314,21 +1318,26 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         dst_mp.copy_from_device_async(src_mp, seg_size)
 
             slot["event"].record(slot["stream"])
-            return chunk_idxs, list(results)
+            return chunk_idxs, list(results), slot_idx
         finally:
             pool.release(slot_idx)
 
-    def _sync_all_get_slots(self) -> None:
-        """Wait for every slot's H2D copies to finish (end-of-request sync)."""
+    def _sync_slots(self, slot_indices: set[int]) -> None:
+        """Wait for this request's slots' H2D copies to finish.
+
+        Only syncs slots the caller actually used — avoids blocking on
+        copies enqueued by other recv threads sharing the pool.
+        """
         pool = self._get_pool
         if pool is None:
             return
-        for slot in pool.slots:
-            slot["event"].synchronize()
+        for idx in slot_indices:
+            pool.slots[idx]["event"].synchronize()
 
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
+        self._last_get_slots = set()
         mask_num = (
             req_meta.load_spec.vllm_cached_tokens  # type: ignore[union-attr]
             // self.block_size
@@ -1484,13 +1493,18 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
         try:
             if self._host_staging and self._get_pool is not None:
-                self._sync_all_get_slots()
+                self._sync_slots(self._last_get_slots)
         except Exception as e:
-            logger.warning(
-                "Failed to sync get staging slots for request %s: %s",
+            # H2D copies may be incomplete — treat as a load failure so the
+            # scheduler retries rather than consuming corrupt KV state.
+            logger.error(
+                "Failed to sync get staging slots for request %s: %s; "
+                "marking %d blocks as load errors",
                 req_id,
                 e,
+                len(block_id_list_c),
             )
+            self._add_load_error_block_ids(block_id_list_c)
         finally:
             self.set_finished_request(req_id)
             self.request_queue.task_done()
