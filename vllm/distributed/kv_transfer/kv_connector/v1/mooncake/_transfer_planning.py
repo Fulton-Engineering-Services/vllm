@@ -1,28 +1,92 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Pure functions for Mooncake KV transfer geometry planning.
 
-Zero worker-class dependencies — importable at module level by every other
-module in the package without circularity.
-"""
+import asyncio
+import logging
+import threading
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from enum import IntEnum
+from typing import TYPE_CHECKING, Any
+import httpx
+import msgspec
+import numpy as np
+import torch
+import zmq
+import zmq.asyncio
+from vllm import envs
+from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.utils import (
+    EngineId,
+    TransferTopology,
+    get_current_attn_backends,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
+    KVConnectorMetadata,
+    KVConnectorRole,
+    SupportsHMA,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
+    MooncakeBootstrapServer,
+    RegisterWorkerPayload,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
+    MooncakeKVConnectorStats,
+)
+from vllm.distributed.parallel_state import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from vllm.forward_context import ForwardContext
+from vllm.logger import init_logger
+from vllm.model_executor.models.utils import extract_layer_index
+from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv
+from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
+from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, get_kv_cache_layout
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+    SlidingWindowSpec,
+)
+from vllm.v1.request import RequestStatus
+from vllm.v1.worker.block_table import BlockTable
+from vllm.v1.worker.utils import select_common_block_size
+
+
+logger = init_logger(__name__)
 
 from ._protocol import TransferRegion
 
-
 def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
+    """Return the TP ratio used by heterogeneous TP transfer planning.
+
+    Positive values mean one local rank maps into a larger remote KV region.
+    Negative values mean one local rank must gather from multiple remote KV
+    regions.
+    """
     if local_tp_size >= remote_tp_size:
         assert local_tp_size % remote_tp_size == 0, (
             f"Local tensor parallel size {local_tp_size} is not divisible "
             f"by remote tensor parallel size {remote_tp_size}."
         )
         return local_tp_size // remote_tp_size
+
     assert remote_tp_size % local_tp_size == 0, (
         f"Remote tensor parallel size {remote_tp_size} is not divisible "
         f"by local tensor parallel size {local_tp_size}."
     )
     return -(remote_tp_size // local_tp_size)
-
 
 def _expand_transfer_regions(
     base_addrs: list[int],
@@ -34,6 +98,7 @@ def _expand_transfer_regions(
     group_indices: list[int] | None = None,
     split_kv_regions: list[bool] | None = None,
 ) -> list[TransferRegion]:
+    """Expand registered KV tensors into the regions transferred by Mooncake."""
     assert (
         len(base_addrs)
         == len(block_lens)
@@ -101,7 +166,6 @@ def _expand_transfer_regions(
             )
     return regions
 
-
 def _compute_sender_transfer_plan(
     local_tp_rank: int,
     local_tp_size: int,
@@ -111,9 +175,12 @@ def _compute_sender_transfer_plan(
     remote_kv_block_len: int,
     producer_cache_replicated: bool,
 ) -> tuple[bool, int, int, int]:
+    """Plan one producer-rank to one consumer-rank copy for heterogeneous TP."""
     tp_ratio = _get_tp_ratio(local_tp_size, remote_tp_size)
+
     if tp_ratio == 1:
         return True, 0, 0, local_kv_block_len
+
     if tp_ratio > 0:
         if producer_cache_replicated:
             return local_tp_rank % tp_ratio == 0, 0, 0, local_kv_block_len
@@ -123,8 +190,10 @@ def _compute_sender_transfer_plan(
             (local_tp_rank % tp_ratio) * local_kv_block_len,
             local_kv_block_len,
         )
+
     if producer_cache_replicated:
         return True, 0, 0, local_kv_block_len
+
     ratio_abs = -tp_ratio
     return (
         True,
@@ -133,7 +202,6 @@ def _compute_sender_transfer_plan(
         remote_kv_block_len,
     )
 
-
 def _can_coalesce_block_transfers(
     local_region_block_len: int,
     remote_region_block_len: int,
@@ -141,13 +209,13 @@ def _can_coalesce_block_transfers(
     dst_region_offset: int,
     transfer_len: int,
 ) -> bool:
+    """Whether a contiguous block group can be emitted as one larger copy."""
     return (
         src_region_offset == 0
         and dst_region_offset == 0
         and transfer_len == local_region_block_len
         and transfer_len == remote_region_block_len
     )
-
 
 def _validate_asymmetric_region_lengths(
     local_regions: list[TransferRegion],
@@ -156,13 +224,21 @@ def _validate_asymmetric_region_lengths(
     remote_tp_size: int,
     producer_cache_replicated: bool,
 ) -> str | None:
+    """Validate transfer-region metadata for a fixed producer/consumer pair.
+
+    This checks registered KV regions, not per-request block counts. A region
+    corresponds to one registered KV tensor, or one K/V half after expansion
+    for layouts that store K and V together.
+    """
     if len(local_regions) != len(remote_regions):
         return (
             "Mooncake asymmetric TP requires matching KV region counts between "
             "producer and consumer."
         )
+
     if producer_cache_replicated:
         return None
+
     tp_ratio = _get_tp_ratio(local_tp_size, remote_tp_size)
     for idx, (local_region, remote_region) in enumerate(
         zip(local_regions, remote_regions)
@@ -191,13 +267,20 @@ def _validate_asymmetric_region_lengths(
                     f"{idx}: local={local_region.kv_block_len}, "
                     f"remote={remote_region.kv_block_len}, tp_ratio={tp_ratio}."
                 )
-    return None
 
+    return None
 
 def _align_transfer_regions(
     local_regions: list[TransferRegion],
     remote_regions: list[TransferRegion],
 ) -> tuple[list[TransferRegion], list[TransferRegion], str | None]:
+    """Align KV transfer regions by registered layer-name occurrence.
+
+    PP shards own different layer subsets. Positional matching is therefore
+    wrong once producer and consumer have different PP layouts. Multiple
+    registered transfer buffers for the same layer are represented by repeated
+    layer names and matched by occurrence order.
+    """
 
     def keyed_regions(
         regions: list[TransferRegion],
@@ -250,4 +333,5 @@ def _align_transfer_regions(
             )
         aligned_local.append(local_region)
         aligned_remote.append(remote_region)
+
     return aligned_local, aligned_remote, None
