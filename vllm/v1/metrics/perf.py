@@ -77,6 +77,7 @@ _QUANT_WEIGHT_BYTE_SIZE: dict[str, float] = {
     "auto_gptq": 0.5,
     "deepseek_v4_fp8": 1,
     "gpt_oss_mxfp4": 0.5,
+    "modelopt_mixed": 0.5,  # most weights are NVFP4 (0.5 bytes)
 }
 
 
