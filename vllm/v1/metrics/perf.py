@@ -1425,7 +1425,7 @@ class UnembedMetrics(ComponentMetrics):
     # From BaseConfigParser
     hidden_size: int = Field(..., gt=0)
     vocab_size: int = Field(..., gt=0)
-    weight_byte_size: int = Field(..., gt=0)
+    weight_byte_size: int | float = Field(..., gt=0)
     activation_byte_size: int = Field(..., gt=0)
 
     tp_size: int
