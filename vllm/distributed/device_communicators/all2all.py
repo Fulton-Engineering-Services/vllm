@@ -413,17 +413,25 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         token_hidden_size: int,
         num_experts_per_rank: int,
     ) -> None:
-        # nixl_ep requires GPUDirect RDMA (DMA-buf export).  On unified-memory
-        # platforms such as GB10 / DGX Spark this is unsupported, so fail early
-        # with a clear fallback recommendation.
-        if HostStagingPlatformProbe().enabled(
-            torch.accelerator.current_device_index()
-        ):
+        device_id = torch.accelerator.current_device_index()
+        staging_probe = HostStagingPlatformProbe(
+            {"host_staging": envs.VLLM_NIXL_EP_HOST_STAGING}
+        )
+        host_staging = staging_probe.enabled(device_id)
+        dma_buf_supported = HostStagingPlatformProbe._dma_buf_supported(device_id)
+
+        if host_staging:
+            logger.info_once(
+                "NIXL EP host staging is active; using pinned-host DRAM buffers."
+            )
+        elif not dma_buf_supported:
             raise RuntimeError(
                 "NIXL EP (nixl_ep) all2all requires GPUDirect RDMA / DMA-buf "
                 "support, which is unavailable on this platform (e.g. GB10 / "
-                "DGX Spark unified memory). Use a different EP backend: "
-                "'torch_nccl', 'pynccl', or 'deepep_high_throughput'."
+                "DGX Spark unified memory). Enable host staging with "
+                "VLLM_NIXL_EP_HOST_STAGING=auto/on or use a different EP "
+                "backend: 'torch_nccl', 'pynccl', or "
+                "'deepep_high_throughput'."
             )
 
         from nixl_ep import Buffer  # type: ignore[import-not-found]
@@ -441,6 +449,7 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         buffer = Buffer(
             rank=self.rank,
             tcp_store_group=self.tcp_store_group.store,
+            host_staging=host_staging,
         )
         buffer.update_memory_buffers(
             num_ranks=self.max_num_ep_ranks,

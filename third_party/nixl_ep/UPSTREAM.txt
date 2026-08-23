@@ -1,0 +1,6 @@
+Upstream repository: https://github.com/ai-dynamo/nixl.git
+Pinned tag: v1.4.0
+Pinned commit: c0a1102b94d173049a5478c23e765ba37681e2ca
+Matched wheel: nixl-cu13==1.4.0
+Vendored path: examples/device/ep/
+Vendored on: 2026-08-23

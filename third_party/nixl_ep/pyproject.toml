@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=61.0", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nixl_ep"
+version = "1.4.0+vllm"
+description = "Vendored NIXL EP extension with host-staging support"
+license = {text = "MIT AND Apache-2.0"}
+requires-python = ">=3.10"
