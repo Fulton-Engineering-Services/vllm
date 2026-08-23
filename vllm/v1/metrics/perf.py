@@ -72,7 +72,118 @@ _QUANT_WEIGHT_BYTE_SIZE: dict[str, float] = {
     "moe_wna16": 0.5,
     "inc": 0.5,
     "experts_int8": 1,
+    # Additional methods (verified via get_name())
+    "auto_awq": 0.5,
+    "auto_gptq": 0.5,
+    "deepseek_v4_fp8": 1,
+    "gpt_oss_mxfp4": 0.5,
 }
+
+
+# Mapping from modelopt_mixed quant_algo names to effective weight byte size.
+# Used by _compute_modelopt_mixed_component_byte_sizes.
+_MODELOPT_MIXED_ALGO_BYTE_SIZE: dict[str, float] = {
+    "FP8": 1,
+    "MXFP8": 1,
+    "NVFP4": 0.5,
+    "W4A16_NVFP4": 0.5,
+    "W4A16": 0.5,
+    "AWQ": 0.5,
+    "GPTQ": 0.5,
+    "FP4": 0.5,
+    "INT4": 0.5,
+}
+
+
+def _get_modelopt_mixed_algo_byte_size(layer_info: object, default_byte_size: float) -> float:
+    """Return the effective byte size for a single quantized_layers entry."""
+    algo = getattr(layer_info, "quant_algo", None)
+    if algo is None:
+        algo = getattr(layer_info, "algo", None)
+
+    if algo is None:
+        logger.warning_once(
+            "modelopt_mixed parser: layer missing quant_algo, using dtype size"
+        )
+        return default_byte_size
+
+    byte_size = _MODELOPT_MIXED_ALGO_BYTE_SIZE.get(algo)
+    if byte_size is None:
+        logger.warning_once(
+            "modelopt_mixed parser: unknown quant_algo '%s', using dtype size", algo
+        )
+        return default_byte_size
+
+    return byte_size
+
+
+def _classify_quantized_layer(layer_name: str) -> str | None:
+    """Classify a quantized_layers key into a component type."""
+    layer_lower = layer_name.lower()
+
+    # Attention projections
+    if any(layer_lower.endswith(suffix) for suffix in ("q", "k", "v", "qkv", "o", "o_proj")):
+        return "attn"
+
+    # Unembed
+    if layer_lower == "lm_head":
+        return "unembed"
+
+    # Mamba projections / conv / ssm
+    if layer_lower in ("in_proj", "out_proj", "conv1d", "x_proj", "dt_proj", "ssm") \
+            or any(layer_lower.startswith(prefix) for prefix in ("in_proj.", "out_proj.", "conv1d.", "x_proj.", "dt_proj.", "ssm.")):
+        return "mamba"
+
+    # FFN / MoE projections
+    if any(keyword in layer_lower for keyword in ("up_proj", "down_proj", "gate_proj", "experts", "shared_experts")):
+        return "ffn"
+
+    return None
+
+
+def _compute_modelopt_mixed_component_byte_sizes(
+    quant_config: object, default_byte_size: float
+) -> dict[str, float]:
+    """
+    Parse a modelopt_mixed quantized_layers map and return the average
+    effective weight byte size for each component (attn, ffn, mamba, unembed).
+
+    Missing or unknown quant_algo values fall back to ``default_byte_size``.
+    If ``quantized_layers`` is empty, falls back to the coarse
+    ``_QUANT_WEIGHT_BYTE_SIZE["modelopt_mixed"]`` entry for every component.
+    """
+    quantized_layers = getattr(quant_config, "quantized_layers", None) or {}
+
+    if not quantized_layers:
+        coarse = _QUANT_WEIGHT_BYTE_SIZE.get("modelopt_mixed", default_byte_size)
+        return {"attn": coarse, "ffn": coarse, "mamba": coarse, "unembed": coarse}
+
+    component_entries: dict[str, list[float]] = {
+        "attn": [],
+        "ffn": [],
+        "mamba": [],
+        "unembed": [],
+    }
+
+    for layer_name, layer_info in quantized_layers.items():
+        component = _classify_quantized_layer(layer_name)
+        if component is None:
+            logger.warning_once(
+                "modelopt_mixed parser: unknown layer '%s', categorizing as ffn", layer_name
+            )
+            component = "ffn"
+
+        byte_size = _get_modelopt_mixed_algo_byte_size(layer_info, default_byte_size)
+        component_entries[component].append(byte_size)
+
+    component_sizes: dict[str, float] = {}
+    for component, entries in component_entries.items():
+        if entries:
+            component_sizes[component] = sum(entries) / len(entries)
+        else:
+            component_sizes[component] = default_byte_size
+
+    return component_sizes
 
 
 #### Basic Data Types ####
@@ -298,12 +409,12 @@ class ComponentMetrics(BaseModel, ABC):
 
 #### parsers ####
 
-
 class BaseConfigParser(Parser):
     """
     Parses base model configuration.
     Provides: vocab_size, hidden_size, num_attention_heads, num_hidden_layers,
-    weight_byte_size, activation_byte_size, dp_size, tp_size, pp_size, enable_ep
+    weight_byte_size, activation_byte_size, dp_size, tp_size, pp_size, enable_ep,
+    and optionally num_attention_layers from layers_block_type.
     """
 
     def parse(self, args: ParsedArgs, vllm_config: VllmConfig) -> ParsedArgs:
@@ -316,9 +427,32 @@ class BaseConfigParser(Parser):
         args.num_attention_heads = get_required(
             model_config.hf_text_config, "num_attention_heads"
         )
-        args.num_hidden_layers = get_required(
-            model_config.hf_text_config, "num_hidden_layers"
-        )
+
+        # Determine number of layers from layers_block_type if available,
+        # otherwise fall back to num_hidden_layers
+        hf_config = model_config.hf_text_config
+        if hasattr(hf_config, "layers_block_type"):
+            block_types = hf_config.layers_block_type
+            if isinstance(block_types, str):
+                block_types = [block_types]
+            # Count entries by type
+            attn_count = sum(1 for bt in block_types if bt == "attention")
+            moe_count = sum(1 for bt in block_types if bt == "moe")
+            mamba_count = sum(1 for bt in block_types if bt == "mamba")
+            mlp_count = sum(1 for bt in block_types if bt == "mlp")
+
+            args.num_hidden_layers = len(block_types)  # total
+            args.num_attention_layers = attn_count
+            # Layer-type-aware counts for FfnMetrics (-1 sentinel means "not from block type")
+            args.num_moe_layers_from_block_type = moe_count
+            args.num_dense_ffn_layers_from_block_type = mlp_count
+        else:
+            args.num_hidden_layers = get_required(
+                model_config.hf_text_config, "num_hidden_layers"
+            )
+            args.num_attention_layers = None  # will use num_hidden_layers fallback
+            args.num_moe_layers_from_block_type = -1
+            args.num_dense_ffn_layers_from_block_type = -1
 
         model_dtype = vllm_config.model_config.dtype
 
@@ -385,13 +519,54 @@ class AttentionQuantizationConfigParser(Parser):
             return args
 
         quant_method = cfg.get_name()
-        if quant_method in _QUANT_WEIGHT_BYTE_SIZE:
+
+        if quant_method == "modelopt_mixed":
+            args = self._parse_modelopt_mixed_attn(cfg, args)
+        elif quant_method in _QUANT_WEIGHT_BYTE_SIZE:
             args.weight_byte_size = _QUANT_WEIGHT_BYTE_SIZE[quant_method]
         else:
             raise InvalidComponent(
                 f"Unsupported quantization method for attention metrics: {quant_method}"
             )
 
+        return args
+
+    def _parse_modelopt_mixed_attn(self, cfg, args: ParsedArgs) -> ParsedArgs:
+        """Parse per-component weight byte size from quantized_layers for modelopt_mixed."""
+        component_sizes = _compute_modelopt_mixed_component_byte_sizes(
+            cfg, args.weight_byte_size
+        )
+        args.weight_byte_size = component_sizes.get("attn", args.weight_byte_size)
+        return args
+
+
+class UnembedQuantizationConfigParser(Parser):
+    """
+    Parses quantization configuration for unembed (lm_head) layers.
+    Overrides: weight_byte_size
+    """
+
+    def parse(self, args: ParsedArgs, vllm_config: VllmConfig) -> ParsedArgs:
+        cfg = vllm_config.quant_config
+
+        if cfg is None:
+            return args
+
+        quant_method = cfg.get_name()
+        if quant_method == "modelopt_mixed":
+            component_sizes = _compute_modelopt_mixed_component_byte_sizes(
+                cfg, args.weight_byte_size
+            )
+            args.weight_byte_size = component_sizes.get("unembed", args.weight_byte_size)
+        elif quant_method in _QUANT_WEIGHT_BYTE_SIZE:
+            args.weight_byte_size = _QUANT_WEIGHT_BYTE_SIZE[quant_method]
+        else:
+            # Fall back to dtype-based byte size
+            model_dtype = vllm_config.model_config.dtype
+            if isinstance(model_dtype, torch.dtype):
+                args.weight_byte_size = get_dtype_size(model_dtype)
+            else:
+                args.weight_byte_size = 2  # default bfloat16
         return args
 
 
@@ -446,7 +621,7 @@ class AttentionMetrics(ComponentMetrics):
         self, ctx: ExecutionContext, per_gpu: bool = True
     ) -> dict[str, int]:
         L, D, q, kv, d = (
-            self.num_hidden_layers,
+            self.num_attention_layers if self.num_attention_layers is not None else self.num_hidden_layers,
             self.hidden_size,
             self.num_attention_heads,
             self.num_key_value_heads,
@@ -472,7 +647,7 @@ class AttentionMetrics(ComponentMetrics):
         self, ctx: ExecutionContext, per_gpu: bool = True
     ) -> dict[str, int]:
         L, D, q, kv, d = (
-            self.num_hidden_layers,
+            self.num_attention_layers if self.num_attention_layers is not None else self.num_hidden_layers,
             self.hidden_size,
             self.num_attention_heads,
             self.num_key_value_heads,
@@ -518,7 +693,7 @@ class AttentionMetrics(ComponentMetrics):
     ) -> dict[str, int]:
         """Calculate write memory traffic for attention layers."""
         L, D, q, kv, d = (
-            self.num_hidden_layers,
+            self.num_attention_layers if self.num_attention_layers is not None else self.num_hidden_layers,
             self.hidden_size,
             self.num_attention_heads,
             self.num_key_value_heads,
@@ -816,7 +991,7 @@ class BaseFfnConfigParser(Parser):
     """
     Parses FFN and MoE configuration.
     Provides: intermediate_size, num_experts, num_experts_per_tok,
-    moe_intermediate_size, num_shared_experts, num_moe_layers
+    moe_intermediate_size, num_shared_experts, num_moe_layers, mlp_hidden_act
     """
 
     def parse(self, args: ParsedArgs, vllm_config: VllmConfig) -> ParsedArgs:
@@ -837,6 +1012,9 @@ class BaseFfnConfigParser(Parser):
         args.num_shared_experts = getattr_from_list(
             cfg, ["n_shared_experts", "num_shared_experts"], 0
         )
+
+        # NemotronH non-gated MoE signal: mlp_hidden_act == "relu2"
+        args.mlp_hidden_act = getattr(cfg, "mlp_hidden_act", None)
 
         is_moe = args.num_experts != 0
         # Assume all MoE layers by default
@@ -932,13 +1110,24 @@ class FfnQuantizationConfigParser(Parser):
             return args
 
         quant_method = cfg.get_name()
-        if quant_method in _QUANT_WEIGHT_BYTE_SIZE:
+
+        if quant_method == "modelopt_mixed":
+            args = self._parse_modelopt_mixed_ffn(cfg, args)
+        elif quant_method in _QUANT_WEIGHT_BYTE_SIZE:
             args.weight_byte_size = _QUANT_WEIGHT_BYTE_SIZE[quant_method]
         else:
             raise InvalidComponent(
                 f"Unsupported quantization method for FFN metrics: {quant_method}"
             )
 
+        return args
+
+    def _parse_modelopt_mixed_ffn(self, cfg, args: ParsedArgs) -> ParsedArgs:
+        """Parse per-component weight byte size from quantized_layers for modelopt_mixed."""
+        component_sizes = _compute_modelopt_mixed_component_byte_sizes(
+            cfg, args.weight_byte_size
+        )
+        args.weight_byte_size = component_sizes.get("ffn", args.weight_byte_size)
         return args
 
 
@@ -962,6 +1151,13 @@ class FfnMetrics(ComponentMetrics):
 
     # From BaseConfigParser, can be overridden InterleaveMoeLayerStep or MoeLayerFreq
     num_moe_layers: int = Field(..., ge=0)
+
+    # From layers_block_type (set by BaseConfigParser when available; -1 means absent)
+    num_moe_layers_from_block_type: int = Field(-1, ge=-1)  # count of "moe" entries
+    num_dense_ffn_layers_from_block_type: int = Field(-1, ge=-1)  # count of "mlp" entries
+
+    # From BaseFfnConfigParser
+    mlp_hidden_act: str | None = Field(None)
 
     # FIXME: might have to make this more granular
     # (i.e. dense_weight_byte_size, moe_routed_weight_byte_size,
@@ -1000,16 +1196,21 @@ class FfnMetrics(ComponentMetrics):
         self, ctx: ExecutionContext, per_gpu: bool = True
     ) -> dict[str, int]:
         """Calculate flops breakdown for FFN layers."""
-        L, D, DI = self.num_hidden_layers, self.hidden_size, self.intermediate_size
-        Lm, E, MI, S = (
-            self.num_moe_layers,
+        # Use layer-type counts from blocks if available, otherwise fall back
+        if self.num_moe_layers_from_block_type >= 0:
+            Lm = self.num_moe_layers_from_block_type
+            Ld = self.num_dense_ffn_layers_from_block_type
+        else:
+            Lm = self.num_moe_layers
+            Ld = self.num_hidden_layers - self.num_moe_layers
+
+        D, DI = self.hidden_size, self.intermediate_size
+        E, MI, S = (
             self.num_experts_per_tok,
             self.moe_intermediate_size,
             self.num_shared_experts,
         )
         T = ctx.total_num_tokens()
-
-        Ld = L - Lm
 
         num_activated_tokens = T * E if E else 0
 
@@ -1025,17 +1226,20 @@ class FfnMetrics(ComponentMetrics):
 
         flops = {}
 
-        # Dense FFN layers (SwiGLU: 3 linear layers: up, gate, down)
+        # Dense FFN layers (SwiGLU: up, gate, down projections)
+        # For non-gated MoE (mlp_hidden_act == "relu2"), only 2 GEMMs: up + down
+        num_gemms = 2 if self.mlp_hidden_act == "relu2" else 3
+
         if Ld:
-            flops["dense_ffn"] = 2 * D * 3 * DI * T * Ld
+            flops["dense_ffn"] = 2 * num_gemms * D * DI * T * Ld
 
         # MoE routed experts (each token activates E experts)
         if Lm and E:
-            flops["routed_ffn"] = 2 * D * 3 * MI * num_activated_tokens * Lm
+            flops["routed_ffn"] = 2 * num_gemms * D * MI * num_activated_tokens * Lm
 
         # MoE shared experts (all S shared experts run for every token)
         if Lm and S:
-            flops["shared_ffn"] = 2 * D * 3 * MI * S * T * Lm
+            flops["shared_ffn"] = 2 * num_gemms * D * MI * S * T * Lm
 
         return flops
 
@@ -1043,17 +1247,22 @@ class FfnMetrics(ComponentMetrics):
         self, ctx: ExecutionContext, per_gpu: bool = True
     ) -> dict[str, int]:
         """Calculate read memory traffic for FFN layers."""
-        L, D, DI = self.num_hidden_layers, self.hidden_size, self.intermediate_size
-        Lm, E, MI, S = (
-            self.num_moe_layers,
+        # Use layer-type counts from blocks if available, otherwise fall back
+        if self.num_moe_layers_from_block_type >= 0:
+            Lm = self.num_moe_layers_from_block_type
+            Ld = self.num_dense_ffn_layers_from_block_type
+        else:
+            Lm = self.num_moe_layers
+            Ld = self.num_hidden_layers - self.num_moe_layers
+
+        D, DI = self.hidden_size, self.intermediate_size
+        E, MI, S = (
             self.num_experts_per_tok,
             self.moe_intermediate_size,
             self.num_shared_experts,
         )
         T = ctx.total_num_tokens()
         num_experts = self.num_experts
-
-        Ld = L - Lm
 
         num_activated_tokens = T * E if E else 0
 
@@ -1071,13 +1280,16 @@ class FfnMetrics(ComponentMetrics):
 
         read_bytes = {}
 
-        # Dense FFN layers (3 GEMMs: up, gate, down projections + SiLU activation)
+        # Dense FFN layers (SwiGLU: up, gate, down projections + SiLU activation)
+        # For non-gated MoE (mlp_hidden_act == "relu2"), only 2 GEMMs: up + down
+        num_gemms = 2 if self.mlp_hidden_act == "relu2" else 3
+
         if Ld:
             read_bytes["dense_up_gate_input"] = int(
                 T * D * self.activation_byte_size * Ld
             )
             read_bytes["dense_up_gate_weights"] = int(
-                2 * D * DI * self.weight_byte_size * Ld
+                num_gemms * D * DI * self.weight_byte_size * Ld
             )
             read_bytes["dense_silu_input"] = int(
                 2 * T * DI * self.activation_byte_size * Ld
@@ -1085,7 +1297,9 @@ class FfnMetrics(ComponentMetrics):
             read_bytes["dense_down_input"] = int(
                 T * DI * self.activation_byte_size * Ld
             )
-            read_bytes["dense_down_weights"] = int(D * DI * self.weight_byte_size * Ld)
+            read_bytes["dense_down_weights"] = int(
+                num_gemms * D * DI * self.weight_byte_size * Ld
+            )
 
         if Lm:
             # MoE routed expert reads
@@ -1097,7 +1311,7 @@ class FfnMetrics(ComponentMetrics):
                     num_activated_tokens * D * self.activation_byte_size * Lm
                 )
                 read_bytes["routed_up_gate_weights"] = int(
-                    2 * D * MI * num_activated_experts * self.weight_byte_size * Lm
+                    num_gemms * D * MI * num_activated_experts * self.weight_byte_size * Lm
                 )
                 read_bytes["routed_silu_input"] = int(
                     2 * num_activated_tokens * MI * self.activation_byte_size * Lm
@@ -1106,7 +1320,7 @@ class FfnMetrics(ComponentMetrics):
                     num_activated_tokens * MI * self.activation_byte_size * Lm
                 )
                 read_bytes["routed_down_weights"] = int(
-                    D * MI * num_activated_experts * self.weight_byte_size * Lm
+                    num_gemms * D * MI * num_activated_experts * self.weight_byte_size * Lm
                 )
 
             # MoE shared expert reads
@@ -1115,7 +1329,7 @@ class FfnMetrics(ComponentMetrics):
                     T * D * self.activation_byte_size * Lm
                 )
                 read_bytes["shared_up_gate_weights"] = int(
-                    2 * D * MI * S * self.weight_byte_size * Lm
+                    num_gemms * D * MI * S * self.weight_byte_size * Lm
                 )
                 read_bytes["shared_silu_input"] = int(
                     2 * T * MI * S * self.activation_byte_size * Lm
@@ -1124,7 +1338,7 @@ class FfnMetrics(ComponentMetrics):
                     T * MI * self.activation_byte_size * Lm
                 )
                 read_bytes["shared_down_weights"] = int(
-                    D * MI * S * self.weight_byte_size * Lm
+                    num_gemms * D * MI * S * self.weight_byte_size * Lm
                 )
 
         return read_bytes
@@ -1133,16 +1347,21 @@ class FfnMetrics(ComponentMetrics):
         self, ctx: ExecutionContext, per_gpu: bool = True
     ) -> dict[str, int]:
         """Calculate write memory traffic for FFN layers."""
-        L, D, DI = self.num_hidden_layers, self.hidden_size, self.intermediate_size
-        Lm, E, MI, S = (
-            self.num_moe_layers,
+        # Use layer-type counts from blocks if available, otherwise fall back
+        if self.num_moe_layers_from_block_type >= 0:
+            Lm = self.num_moe_layers_from_block_type
+            Ld = self.num_dense_ffn_layers_from_block_type
+        else:
+            Lm = self.num_moe_layers
+            Ld = self.num_hidden_layers - self.num_moe_layers
+
+        D, DI = self.hidden_size, self.intermediate_size
+        E, MI, S = (
             self.num_experts_per_tok,
             self.moe_intermediate_size,
             self.num_shared_experts,
         )
         T = ctx.total_num_tokens()
-
-        Ld = L - Lm
 
         num_activated_tokens = T * E if E else 0
 
@@ -1159,6 +1378,8 @@ class FfnMetrics(ComponentMetrics):
         write_bytes = {}
 
         # Dense FFN layers
+        num_gemms = 2 if self.mlp_hidden_act == "relu2" else 3
+
         if Ld:
             write_bytes["dense_up_gate_output"] = int(
                 2 * T * DI * self.activation_byte_size * Ld
@@ -1167,11 +1388,11 @@ class FfnMetrics(ComponentMetrics):
                 T * DI * self.activation_byte_size * Ld
             )
             write_bytes["dense_down_output"] = int(
-                T * D * self.activation_byte_size * Ld
+                num_gemms * T * D * self.activation_byte_size * Ld
             )
 
-        # MoE outputs
         if Lm:
+            # MoE outputs
             if E:
                 write_bytes["routed_up_gate_output"] = int(
                     2 * num_activated_tokens * MI * self.activation_byte_size * Lm
@@ -1180,7 +1401,7 @@ class FfnMetrics(ComponentMetrics):
                     num_activated_tokens * MI * self.activation_byte_size * Lm
                 )
                 write_bytes["routed_down_output"] = int(
-                    num_activated_tokens * D * self.activation_byte_size * Lm
+                    num_gemms * num_activated_tokens * D * self.activation_byte_size * Lm
                 )
             if S:
                 write_bytes["shared_up_gate_output"] = int(
@@ -1190,7 +1411,7 @@ class FfnMetrics(ComponentMetrics):
                     T * S * MI * self.activation_byte_size * Lm
                 )
                 write_bytes["shared_down_output"] = int(
-                    T * S * D * self.activation_byte_size * Lm
+                    num_gemms * T * S * D * self.activation_byte_size * Lm
                 )
 
         return write_bytes
@@ -1216,6 +1437,7 @@ class UnembedMetrics(ComponentMetrics):
     def get_parser(cls) -> ParserChain:
         return ParserChain(
             BaseConfigParser(),
+            UnembedQuantizationConfigParser(),
         )
 
     def get_num_flops_breakdown(
@@ -1260,6 +1482,286 @@ class UnembedMetrics(ComponentMetrics):
         return {
             "output": T * V * self.activation_byte_size,
         }
+
+
+#### MambaMetrics ####
+
+
+class MambaMetrics(ComponentMetrics):
+    """
+    Performance metrics for Mamba/GDN layers.
+
+    Mamba (Gated Linear Activation) layer FLOPs and memory:
+    - in_proj: projects input to [intermediate_size + conv_dim + num_heads]
+    - conv1d: 1D convolution with kernel_size=conv_kernel
+    - ssm: state update (A*dA + B⊗x + C·state_read) per token
+
+    Uses per-component weight_byte_size from modelopt_mixed quantization,
+    or dtype-based fallback.
+    """
+
+    # From BaseConfigParser
+    hidden_size: int = Field(..., gt=0)
+    intermediate_size: int = Field(..., gt=0)
+    ssm_state_size: int = Field(..., gt=0)
+    ssm_state_byte_size: int | float = Field(..., gt=0)
+    n_groups: int = Field(..., gt=0)
+    conv_kernel: int = Field(..., gt=0)
+    num_mamba_layers: int = Field(..., gt=0)
+    activation_byte_size: int = Field(..., gt=0)
+    tp_size: int = Field(..., gt=0)
+    pp_size: int = Field(..., gt=0)
+    weight_byte_size: int | float = Field(..., gt=0)
+
+    # From Mamba mixer configuration
+    num_heads: int = Field(..., gt=0)  # mamba head count (for in_proj_out calc)
+
+    @classmethod
+    def component_type(cls) -> str:
+        return "mamba"
+
+    @classmethod
+    def get_parser(cls) -> ParserChain:
+        return ParserChain(
+            BaseConfigParser(),
+            MambaDetectionParser(),
+            MambaConfigParser(),
+            MambaQuantizationConfigParser(),
+        )
+
+    def get_num_flops_breakdown(
+        self, ctx: ExecutionContext, per_gpu: bool = True
+    ) -> dict[str, int]:
+        """Calculate flops breakdown for Mamba layers."""
+        L, D, I, N = (
+            self.num_mamba_layers,
+            self.hidden_size,
+            self.intermediate_size,
+            self.n_groups,
+        )
+        H = self.num_heads
+        K = self.conv_kernel
+        T = ctx.total_num_tokens()
+
+        if per_gpu:
+            L //= self.pp_size
+
+        # in_proj = 2 * T * D * in_proj_out
+        # in_proj_out = I + conv_dim + H where conv_dim = I + 2*N*ssm_state_size
+        conv_dim = I + 2 * N * self.ssm_state_size
+        in_proj_out = I + conv_dim + H
+
+        flops = {}
+
+        # in_proj: input projection
+        flops["mamba_in_proj"] = 2 * T * D * in_proj_out * L
+
+        # out_proj: output projection
+        flops["mamba_out_proj"] = 2 * T * I * D * L
+
+        # conv1d
+        flops["mamba_conv1d"] = 2 * T * conv_dim * K * L
+
+        # ssm: first-order approximation (A*dA + B⊗x + C·state_read)
+        # 6 * T * I * ssm_state_size per layer
+        flops["mamba_ssm"] = 6 * T * I * self.ssm_state_size * L
+
+        return flops
+
+    def get_read_bytes_breakdown(
+        self, ctx: ExecutionContext, per_gpu: bool = True
+    ) -> dict[str, int]:
+        """Calculate read memory traffic for Mamba layers."""
+        L, D, I, N = (
+            self.num_mamba_layers,
+            self.hidden_size,
+            self.intermediate_size,
+            self.n_groups,
+        )
+        H = self.num_heads
+        K = self.conv_kernel
+        T = ctx.total_num_tokens()
+
+        if per_gpu:
+            L //= self.pp_size
+
+        conv_dim = I + 2 * N * self.ssm_state_size
+        in_proj_out = I + conv_dim + H
+
+        read_bytes = {}
+
+        # in_proj weight + input reads
+        read_bytes["mamba_in_proj_weight"] = int(
+            D * in_proj_out * self.weight_byte_size * L
+        )
+        read_bytes["mamba_in_proj_input"] = T * D * self.activation_byte_size * L
+
+        # out_proj weight + input reads
+        read_bytes["mamba_out_proj_weight"] = int(I * D * self.weight_byte_size * L)
+        read_bytes["mamba_out_proj_input"] = T * I * self.activation_byte_size * L
+
+        # conv1d weight + input reads
+        read_bytes["mamba_conv1d_weight"] = int(
+            conv_dim * K * self.weight_byte_size * L
+        )
+        read_bytes["mamba_conv1d_input"] = T * conv_dim * self.activation_byte_size * L
+
+        # ssm state read (per token)
+        read_bytes["mamba_ssm_state_read"] = (
+            T * I * self.ssm_state_size * self.ssm_state_byte_size * L
+        )
+
+        return read_bytes
+
+    def get_write_bytes_breakdown(
+        self, ctx: ExecutionContext, per_gpu: bool = True
+    ) -> dict[str, int]:
+        """Calculate write memory traffic for Mamba layers."""
+        L, D, I, N = (
+            self.num_mamba_layers,
+            self.hidden_size,
+            self.intermediate_size,
+            self.n_groups,
+        )
+        H = self.num_heads
+        K = self.conv_kernel
+        T = ctx.total_num_tokens()
+
+        if per_gpu:
+            L //= self.pp_size
+
+        conv_dim = I + 2 * N * self.ssm_state_size
+        in_proj_out = I + conv_dim + H
+
+        write_bytes = {}
+
+        # in_proj output writes
+        write_bytes["mamba_in_proj_output"] = T * in_proj_out * self.activation_byte_size * L
+
+        # out_proj output writes
+        write_bytes["mamba_out_proj_output"] = T * I * self.activation_byte_size * L
+
+        # conv1d output writes
+        write_bytes["mamba_conv1d_output"] = T * conv_dim * self.activation_byte_size * L
+
+        # ssm state write (per token)
+        write_bytes["mamba_ssm_state_write"] = (
+            T * I * self.ssm_state_size * self.ssm_state_byte_size * L
+        )
+
+        return write_bytes
+
+
+class MambaDetectionParser(Parser):
+    """
+    Prevents MambaMetrics from being instantiated when there are no
+    "mamba" entries in layers_block_type. Dense models skip it.
+    """
+
+    def parse(self, args: ParsedArgs, vllm_config: VllmConfig) -> ParsedArgs:
+        hf_config = vllm_config.model_config.hf_text_config
+        if not hasattr(hf_config, "layers_block_type"):
+            raise InvalidComponent("Model has no layers_block_type; assuming dense model")
+
+        block_types = hf_config.layers_block_type
+        if isinstance(block_types, str):
+            block_types = [block_types]
+
+        if not any(bt == "mamba" for bt in block_types):
+            raise InvalidComponent("Model has no mamba layers")
+
+        return args
+
+
+class MambaConfigParser(Parser):
+    """
+    Parses Mamba-specific configuration fields from hf_config.
+    Provides: hidden_size, intermediate_size, ssm_state_size, n_groups,
+    conv_kernel, num_mamba_layers, num_heads, ssm_state_byte_size
+    """
+
+    def parse(self, args: ParsedArgs, vllm_config: VllmConfig) -> ParsedArgs:
+        cfg = vllm_config.model_config.hf_text_config
+        if hasattr(cfg, "text_config") and cfg.text_config is not None:
+            cfg = cfg.text_config
+
+        # hidden_size from BaseConfigParser
+
+        # intermediate_size = mamba_num_heads * mamba_head_dim
+        mamba_num_heads = getattr(cfg, "mamba_num_heads", None)
+        mamba_head_dim = getattr(cfg, "mamba_head_dim", None)
+        if mamba_num_heads is not None and mamba_head_dim is not None:
+            args.intermediate_size = mamba_num_heads * mamba_head_dim
+        else:
+            # Fallback to an explicit intermediate_size if available
+            args.intermediate_size = getattr(
+                cfg, "intermediate_size", args.hidden_size * 4
+            )
+
+        # ssm_state_size
+        args.ssm_state_size = getattr(cfg, "ssm_state_size", 16)
+
+        # ssm_state_byte_size from cache config if exposed, else fp32 default
+        cache_config = vllm_config.cache_config
+        if (
+            cache_config is not None
+            and hasattr(cache_config, "mamba_ssm_cache_dtype")
+            and cache_config.mamba_ssm_cache_dtype is not None
+        ):
+            mamba_dtype = cache_config.mamba_ssm_cache_dtype
+            if isinstance(mamba_dtype, torch.dtype):
+                args.ssm_state_byte_size = get_dtype_size(mamba_dtype)
+            elif isinstance(mamba_dtype, str) and mamba_dtype in STR_DTYPE_TO_TORCH_DTYPE:
+                args.ssm_state_byte_size = get_dtype_size(STR_DTYPE_TO_TORCH_DTYPE[mamba_dtype])
+            else:
+                args.ssm_state_byte_size = 4  # fp32 fallback
+        else:
+            args.ssm_state_byte_size = 4  # fp32 default
+
+        # n_groups
+        args.n_groups = getattr(cfg, "n_groups", 1)
+
+        # conv_kernel
+        args.conv_kernel = getattr(cfg, "conv_kernel", 4)
+
+        # num_mamba_layers
+        args.num_mamba_layers = getattr(cfg, "num_mamba_layers", None)
+        if args.num_mamba_layers is None:
+            # Fall back to num_hidden_layers if not specified
+            args.num_mamba_layers = getattr(cfg, "num_hidden_layers", 0)
+
+        # num_heads (mamba head count for in_proj_out calculation)
+        args.num_heads = getattr(cfg, "num_heads", None)
+        if args.num_heads is None:
+            # Infer from mamba_num_heads if available
+            args.num_heads = getattr(cfg, "mamba_num_heads", 1)
+
+        return args
+
+
+class MambaQuantizationConfigParser(Parser):
+    """
+    Parses quantization configuration for Mamba layers when using modelopt_mixed.
+    Classifies quantized_layers keys by suffix and maps quant_algo → bytes.
+    """
+
+    def parse(self, args: ParsedArgs, vllm_config: VllmConfig) -> ParsedArgs:
+        cfg = vllm_config.quant_config
+
+        if cfg is None:
+            return args
+
+        quant_method = cfg.get_name()
+
+        if quant_method == "modelopt_mixed":
+            component_sizes = _compute_modelopt_mixed_component_byte_sizes(
+                cfg, args.weight_byte_size
+            )
+            args.weight_byte_size = component_sizes.get("mamba", args.weight_byte_size)
+        elif quant_method in _QUANT_WEIGHT_BYTE_SIZE:
+            args.weight_byte_size = _QUANT_WEIGHT_BYTE_SIZE[quant_method]
+
+        return args
 
 
 #### ModelMetrics ####
