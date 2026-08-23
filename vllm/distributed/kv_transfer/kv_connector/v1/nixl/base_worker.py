@@ -32,6 +32,9 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.host_staging_adapter import (
+    NixlHostStagingAdapter,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
     NixlAgentMetadata,
@@ -555,6 +558,9 @@ class NixlBaseConnectorWorker:
             "enforce_handshake_compat", True
         )
 
+        # Optional host-staging adapter (GB10 / unified-memory fallback).
+        self.host_staging_adapter = NixlHostStagingAdapter(self)
+
     def _sync_block_size_with_kernel(self) -> None:
         backends = get_current_attn_backends(self.vllm_config)
         kernel_block_size = select_common_block_size(self.block_size, backends)
@@ -1010,6 +1016,8 @@ class NixlBaseConnectorWorker:
             self.register_local_xfer_handler(self.block_size)
         )
 
+        self.host_staging_adapter.register_kv_caches(kv_caches)
+
         agent_metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.nixl_wrapper.get_agent_metadata(),
@@ -1025,6 +1033,9 @@ class NixlBaseConnectorWorker:
             attn_backend_name=self.backend_name,
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
+            ),
+            staging_window_base_addrs=(
+                self.host_staging_adapter.get_staging_window_base_addrs()
             ),
         )
         assert self.compat_hash is not None
@@ -1250,6 +1261,8 @@ class NixlBaseConnectorWorker:
             self.register_local_xfer_handler(self.block_size)
         )
 
+        self.host_staging_adapter.register_kv_caches(kv_caches)
+
         # After KV Caches registered, listen for new connections.
         agent_metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
@@ -1266,6 +1279,9 @@ class NixlBaseConnectorWorker:
             attn_backend_name=self.backend_name,
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
+            ),
+            staging_window_base_addrs=(
+                self.host_staging_adapter.get_staging_window_base_addrs()
             ),
         )
         # Wrap metadata in payload with hash for defensive decoding
@@ -1443,6 +1459,58 @@ class NixlBaseConnectorWorker:
             addrs = base_addr + rank_offset + block_arange * page_size
             parts.append(self._stack_descs(addrs, local_block_len, device_id))
         return np.concatenate(parts)
+
+    def _add_remote_staging_agent(
+        self,
+        remote_agent_name: str,
+        nixl_agent_meta: NixlAgentMetadata,
+        plan: "TPMapping",
+        block_size_ratio: int,
+    ) -> int:
+        """Build remote descriptors against the consumer's pinned receive window.
+
+        This is a Phase 3 stub: it builds per-slot DRAM descriptors over the
+        remote ``staging_window_base_addrs``.  Full push/pull descriptor ID
+        mapping (including slot assignment from PUSH_REG/PUSH_STAGED notifs)
+        is left to the staged-transfer implementation.
+        """
+        assert nixl_agent_meta.staging_window_base_addrs is not None
+        logger.info(
+            "Registering remote staging window for engine %s rank %s",
+            nixl_agent_meta.engine_id,
+            remote_agent_name,
+        )
+
+        total_descs = nixl_agent_meta.num_blocks * len(nixl_agent_meta.block_lens)
+        if total_descs > self.num_blocks * len(self.block_len_per_layer) * 4:
+            raise RuntimeError(
+                f"Remote staging descriptor count {total_descs} "
+                f"(num_blocks={nixl_agent_meta.num_blocks} * "
+                f"block_lens={len(nixl_agent_meta.block_lens)}) exceeds "
+                f"4x local capacity ({self.num_blocks} * "
+                f"{len(self.block_len_per_layer)}). Possible metadata "
+                f"corruption or malicious peer."
+            )
+
+        # Homogeneous-TP assumption for the stub: the remote window uses the
+        # same block_len layout and one descriptor per window slot.  The
+        # descriptor IDs will be matched to actual slot IDs sent in the
+        # PUSH_REG/PUSH_STAGED notification.
+        blocks_data: list[tuple[int, int, int]] = []
+        for base_addr, block_len in zip(
+            nixl_agent_meta.staging_window_base_addrs,
+            nixl_agent_meta.block_lens,
+        ):
+            # Register one descriptor per logical window slot.  The real
+            # capacity is negotiated at transfer time via slot IDs; this
+            # over-provisions to the remote engine's logical num_blocks.
+            for slot in range(nixl_agent_meta.num_blocks):
+                blocks_data.append(
+                    (base_addr + slot * block_len, block_len, 0)
+                )
+        arr = np.array(blocks_data, dtype=np.uint64)
+        descs = self.nixl_wrapper.get_xfer_descs(arr, "DRAM")
+        return self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
 
     def register_local_xfer_handler(
         self,
@@ -1664,6 +1732,27 @@ class NixlBaseConnectorWorker:
         # heterogeneous TP, prepare the descriptors by splitting the P KV cache along
         # kv_head dim, of D worker's kv_head size (D>P).
         # Eg. PTP1 DTP2 => P0 KV:[block0-KV_0 | block0-KV_1..].
+
+        # If the remote agent is using host staging, build descriptors against
+        # its pinned receive window rather than its GPU cache.
+        if nixl_agent_meta.staging_window_base_addrs is not None:
+            if not self.host_staging_adapter.enabled:
+                raise RuntimeError(
+                    f"Remote engine {engine_id} advertises host-staging "
+                    f"window addresses but the local worker is not using "
+                    f"host staging. Mixed staging modes are not supported. "
+                    f"Enable host_staging on both P and D, or disable it "
+                    f"on both."
+                )
+            self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
+                self._add_remote_staging_agent(
+                    remote_agent_name,
+                    nixl_agent_meta,
+                    plan,
+                    block_size_ratio,
+                )
+            )
+            return remote_agent_name
 
         # Register all remote blocks, but only the corresponding kv heads.
         blocks_data = self._build_fa_remote(

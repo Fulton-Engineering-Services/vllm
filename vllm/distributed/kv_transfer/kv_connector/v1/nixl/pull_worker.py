@@ -9,6 +9,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    PUSH_STAGED_NOTIF_PREFIX,
     NixlConnectorMetadata,
     ReqMeta,
 )
@@ -70,11 +71,32 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         continue
 
             # Handshake already completed, start async read xfer.
+            if self.host_staging_adapter.enabled:
+                # Phase 4 stub: staged pull sends a registration notif to the
+                # producer instead of issuing READs directly.
+                logger.warning(
+                    "NIXL staged pull transfer is not fully implemented; "
+                    "request %s will be retried by the scheduler. "
+                    "Disable host staging or use a platform with DMA-buf support.",
+                    req_id,
+                )
+                self._handle_failed_transfer(req_id, None)
+                continue
             self._read_blocks_for_req(req_id, meta)
 
         # Start transfers for requests whose handshakes have now finished.
         while not self._ready_requests.empty():
-            self._read_blocks_for_req(*self._ready_requests.get_nowait())
+            req_id, meta = self._ready_requests.get_nowait()
+            if self.host_staging_adapter.enabled:
+                logger.warning(
+                    "NIXL staged pull transfer is not fully implemented; "
+                    "request %s will be retried by the scheduler. "
+                    "Disable host staging or use a platform with DMA-buf support.",
+                    req_id,
+                )
+                self._handle_failed_transfer(req_id, None)
+                continue
+            self._read_blocks_for_req(req_id, meta)
 
         # Keep around the requests that have been part of a batch. This is
         # needed because async scheduling pushes the misalignment between the
@@ -392,6 +414,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     self.consumer_notification_counts_by_req[req_id]
                     == consumers_per_producer
                 ):
+                    # Host staging: replay H2D from receive window before the
+                    # scheduler sees the completed transfer.
+                    if self.host_staging_adapter.recv_window is not None:
+                        meta = self._recving_metadata.get(req_id)
+                        if meta is not None:
+                            self.host_staging_adapter.replay_recv_h2d(meta)
                     notified_req_ids.add(req_id)
                     del self.consumer_notification_counts_by_req[req_id]
                     self._reqs_to_process.remove(req_id)

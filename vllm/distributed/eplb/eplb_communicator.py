@@ -19,6 +19,10 @@ from torch.distributed import (
     batch_isend_irecv,
 )
 
+from vllm.distributed.kv_transfer.kv_connector.v1.host_staging import (
+    HostStagingPlatformProbe,
+    PinnedHostStagingArena,
+)
 import vllm.distributed.nixl_utils as nixl_utils
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.device_communicators.pynccl_wrapper import (
@@ -315,6 +319,21 @@ class NixlEplbCommunicator(EplbCommunicator):
         ] = {}
 
         self._cuda_device_id = int(self._device.index or 0)
+
+        # Host staging for platforms without DMA-buf (e.g. GB10 / DGX Spark).
+        self._host_staging_enabled = HostStagingPlatformProbe().enabled(
+            self._cuda_device_id
+        )
+        if self._host_staging_enabled:
+            raise RuntimeError(
+                "NIXL EPLB host staging is not yet implemented. "
+                "Use a non-NIXL EP backend (torch_nccl, pynccl, or "
+                "deepep_high_throughput) on this platform."
+            )
+        self._staging_send_arena: PinnedHostStagingArena | None = None
+        self._staging_recv_arena: PinnedHostStagingArena | None = None
+        self._staging_slice_size: int = 0
+
         self._remote_state_initialized = False
         self._init_step("buffers", self._init_registered_buffers)
         if defer_remote_setup:
@@ -397,6 +416,14 @@ class NixlEplbCommunicator(EplbCommunicator):
         assert self._expert_to_src_row is not None and self._layer_idx is not None, (
             "set_transfer_context() must be called before add_recv()"
         )
+
+        # Host staging (GB10 / unified-memory) EPLB path stub.
+        if self._host_staging_enabled:
+            raise NotImplementedError(
+                "NIXL EPLB host staging is not fully implemented yet. "
+                "Use a non-NIXL EP backend on this platform."
+            )
+
         src_row = self._expert_to_src_row[src_rank][expert_id]
         layer_idx = self._layer_idx
 
@@ -454,6 +481,37 @@ class NixlEplbCommunicator(EplbCommunicator):
         descs = self._nixl_wrapper.get_reg_descs(all_tensors)
         self._nixl_wrapper.register_memory(descs)
         self._registered_descs.append(descs)
+
+    def _init_staging_arenas(self) -> None:
+        """Allocate pinned host arenas sized to the largest expert slice."""
+        max_slice = 0
+        for layer_tensors in self._all_expert_weights:
+            for tensor in layer_tensors:
+                max_slice = max(max_slice, tensor.nbytes // self._num_local_experts)
+        for tensor in self._expert_buffer:
+            max_slice = max(max_slice, tensor.nbytes)
+
+        if max_slice == 0:
+            raise RuntimeError("NIXL EPLB staging: largest expert slice is 0 bytes")
+        self._staging_slice_size = max_slice
+
+        def _register_arena(base_ptr: int, size: int) -> None:
+            descs = self._nixl_wrapper.get_reg_descs(
+                [(base_ptr, size, self._cuda_device_id, "")], "DRAM"
+            )
+            self._nixl_wrapper.register_memory(descs)
+            self._registered_descs.append(descs)
+
+        self._staging_send_arena = PinnedHostStagingArena(
+            max_slice, "eplb-send", register_fn=_register_arena
+        )
+        self._staging_recv_arena = PinnedHostStagingArena(
+            max_slice, "eplb-recv", register_fn=_register_arena
+        )
+        logger.info(
+            "NIXL EPLB host staging enabled: arenas sized to %d bytes per slice",
+            max_slice,
+        )
 
     def _exchange_remote_send_meta(self) -> None:
         """Exchange per-layer per-tensor metadata so receivers can compute
@@ -576,6 +634,13 @@ class NixlEplbCommunicator(EplbCommunicator):
         )
         try:
             self._wait_for_all_transfers([x[2] for x in self._xfer_entries])
+
+            # Host staging: copy received slices from the pinned recv arena to
+            # the destination GPU tensors.  Full implementation is Phase 6.
+            if self._host_staging_enabled:
+                raise NotImplementedError(
+                    "NIXL EPLB host staging H2D copy is not fully implemented yet."
+                )
 
             self._post_read_barrier()
         finally:

@@ -46,6 +46,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
+    PUSH_STAGED_NOTIF_PREFIX,
     NixlConnectorMetadata,
     RemoteMeta,
     ReqId,
@@ -622,6 +623,17 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         notif_id = f"{remote_request_id}:{self.world_size}".encode()
 
+        # Host staging (GB10 / unified-memory) push path stub.
+        if self.host_staging_adapter.enabled:
+            logger.warning(
+                "NIXL staged push transfer is not fully implemented; "
+                "request %s will be retried by the scheduler. "
+                "Disable host staging or use a platform with DMA-buf support.",
+                request_id,
+            )
+            self.xfer_stats.record_failed_transfer()
+            return None
+
         if len(local_block_ids) == 0:
             logger.warning("No blocks to push for request %s", request_id)
             return None
@@ -726,6 +738,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     # materialise an empty ``_recving_transfers`` entry for
                     # ``_pop_done_transfers`` to report done.
                     self._recving_transfers.setdefault(req_id, [])
+                    # If host staging is active, replay H2D from the receive
+                    # window before declaring the request done.
+                    if self.host_staging_adapter.recv_window is not None:
+                        self.host_staging_adapter.replay_recv_h2d(meta)
                 else:
                     # Not tracked on either side (lease may have expired
                     # before the notif arrived). Log and skip.

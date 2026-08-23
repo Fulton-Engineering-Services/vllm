@@ -24,6 +24,10 @@ GET_META_MSG = b"get_meta_msg"
 # Sent worker-to-worker over NIXL: D worker -> P worker, encoded as
 # PUSH_REG_NOTIF_PREFIX + msgpack(registration_data).
 PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
+# Staged-pull registration notification (host-staging fallback on GB10).
+# Consumer sends this to producer; producer stages blocks into the consumer's
+# receive window and replies with a normal completion notification.
+PUSH_STAGED_NOTIF_PREFIX = b"PUSH_STAGED:"
 #
 # NIXL Connector Version
 #
@@ -41,8 +45,10 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #   4: Add KV block lease renewal through heartbeats
 #   5: Add remote_blocks_expiry_time to kv_transfer_params + handshake
 #      clock-sync timestamp
+#   6: Add optional staging_window_base_addrs to NixlAgentMetadata for
+#      host-staging (GB10/unified-memory) support
 #
-NIXL_CONNECTOR_VERSION: int = 5
+NIXL_CONNECTOR_VERSION: int = 6
 
 
 @dataclass
@@ -58,6 +64,10 @@ class NixlAgentMetadata:
     ssm_sizes: tuple[int, int]
     attn_backend_name: str
     physical_blocks_per_logical_kv_block: int
+    # Optional base addresses of a pinned host receive window.  Present when
+    # the agent is using host staging (GB10 / unified-memory) instead of
+    # exporting GPU memory directly.
+    staging_window_base_addrs: list[int] | None = None
 
 
 @dataclass

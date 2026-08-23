@@ -10,6 +10,9 @@ import torch.distributed as dist
 import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_dp_group, get_ep_group, get_pcp_group
+from vllm.distributed.kv_transfer.kv_connector.v1.host_staging import (
+    HostStagingPlatformProbe,
+)
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -410,6 +413,19 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         token_hidden_size: int,
         num_experts_per_rank: int,
     ) -> None:
+        # nixl_ep requires GPUDirect RDMA (DMA-buf export).  On unified-memory
+        # platforms such as GB10 / DGX Spark this is unsupported, so fail early
+        # with a clear fallback recommendation.
+        if HostStagingPlatformProbe().enabled(
+            torch.accelerator.current_device_index()
+        ):
+            raise RuntimeError(
+                "NIXL EP (nixl_ep) all2all requires GPUDirect RDMA / DMA-buf "
+                "support, which is unavailable on this platform (e.g. GB10 / "
+                "DGX Spark unified memory). Use a different EP backend: "
+                "'torch_nccl', 'pynccl', or 'deepep_high_throughput'."
+            )
+
         from nixl_ep import Buffer  # type: ignore[import-not-found]
 
         max_num_global_experts = self.max_num_ep_ranks * num_experts_per_rank

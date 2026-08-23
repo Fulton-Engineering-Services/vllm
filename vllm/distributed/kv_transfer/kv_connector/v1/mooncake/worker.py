@@ -84,7 +84,11 @@ from ._worker_receive import _WorkerReceiveMixin
 
 from ._worker_setup import _WorkerSetupMixin
 
-from .staging import _PinnedStagingArena, _StagingMixin
+from .staging import (
+    HostStagingPlatformProbe,
+    _PinnedStagingArena,
+    _StagingMixin,
+)
 
 from .mooncake_utils import MooncakeBootstrapServer
 
@@ -134,14 +138,13 @@ class MooncakeConnectorWorker(
             )
             # Host-staging (GB10 / unified memory): transfer KV through pinned
             # host buffers because GPUDirect is architecturally unavailable (see
-            # _PinnedStagingArena). Both ends must run this build; the D side
+            # PinnedHostStagingArena). Both ends must run this build; the D side
             # advertises staging-window addresses in place of its GPU cache
             # geometry, so the wire protocol itself is unchanged.
-            self.host_staging = bool(
-                kv_transfer_config.kv_connector_extra_config.get(  # type: ignore[union-attr]
-                    "host_staging", False
-                )
+            staging_probe = HostStagingPlatformProbe(
+                kv_transfer_config.kv_connector_extra_config
             )
+            self.host_staging = staging_probe.enabled(self.device_id)
             self.staging_send_mib = int(
                 kv_transfer_config.kv_connector_extra_config.get(  # type: ignore[union-attr]
                     "staging_send_mib", 512
