@@ -13,10 +13,8 @@ import torch
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
-from vllm.compilation.monitor import (
-    cudagraph_capturing_enabled,
-    validate_cudagraph_capturing_enabled,
-)
+from vllm.compilation import monitor
+from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.forward_context import (
@@ -276,7 +274,7 @@ class CUDAGraphWrapper:
         entry = self.concrete_cudagraph_entries[batch_descriptor]
 
         if entry.cudagraph is None:
-            if not cudagraph_capturing_enabled:
+            if not monitor.cudagraph_capturing_enabled:
                 # Warmup is past; lazy-capture is disabled — fall back to
                 # eager execution rather than raising RuntimeError.
                 return self.runnable(*args, **kwargs)
@@ -430,7 +428,7 @@ class CUDAGraphWrapper:
             entry = self._logits_cudagraph_entries[batch_descriptor]
 
         if entry.cudagraph is None:
-            if not cudagraph_capturing_enabled:
+            if not monitor.cudagraph_capturing_enabled:
                 # Warmup is past; lazy-capture is disabled — fall back to
                 # eager execution rather than raising RuntimeError.
                 hs = hidden_states[logits_indices] if logits_indices is not None else hidden_states
