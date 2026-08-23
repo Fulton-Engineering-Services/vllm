@@ -587,6 +587,7 @@ class AttentionDetectionParser(Parser):
 class AttentionMetrics(ComponentMetrics):
     # From BaseConfigParser
     num_hidden_layers: int = Field(..., gt=0)
+    num_attention_layers: int | None = Field(None)
     hidden_size: int = Field(..., gt=0)
     num_attention_heads: int = Field(..., gt=0)
     activation_byte_size: int = Field(..., gt=0)
