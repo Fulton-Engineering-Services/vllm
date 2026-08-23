@@ -283,6 +283,9 @@ class BreakableCUDAGraphWrapper:
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
 
         self.entries: dict[BatchDescriptor, _BreakableEntry] = {}
+        # Separate cache for the LM-head logits GEMM, same rationale as
+        # CUDAGraphWrapper._logits_cudagraph_entries.
+        self._logits_entries: dict[BatchDescriptor, _BreakableEntry] = {}
         BreakableCUDAGraphWrapper._all_instances.add(self)
 
         logger.info_once("Breakable CUDA graph enabled")
@@ -304,6 +307,7 @@ class BreakableCUDAGraphWrapper:
 
     def clear_graphs(self) -> None:
         self.entries.clear()
+        self._logits_entries.clear()
 
     # --- dispatch --------------------------------------------------------
 
@@ -418,6 +422,106 @@ class BreakableCUDAGraphWrapper:
             )
         # Sync the offloader's copy stream before replay so any external
         # dependencies from pre-capture prefetches are satisfied.
+        get_offloader().sync_prev_onload()
+        assert entry.capture is not None
+        entry.capture.replay()
+        return entry.output
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        logits_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Capture/replay the LM-head logits GEMM through the breakable
+        cudagraph.  See CUDAGraphWrapper.compute_logits for rationale.
+
+        When ``logits_indices`` is provided the indexing is captured inside
+        the graph so both inputs are persistent buffers with stable
+        addresses.
+
+        Must be called inside a ``set_forward_context`` block.
+        """
+        graph_inputs = [hidden_states]
+        if logits_indices is not None:
+            graph_inputs.append(logits_indices)
+
+        if not is_forward_context_available():
+            hs = hidden_states[logits_indices] if logits_indices is not None else hidden_states
+            return self.runnable.compute_logits(hs)
+
+        forward_context = get_forward_context()
+        batch_descriptor = forward_context.batch_descriptor
+        cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
+
+        if cudagraph_runtime_mode == CUDAGraphMode.NONE:
+            hs = hidden_states[logits_indices] if logits_indices is not None else hidden_states
+            return self.runnable.compute_logits(hs)
+
+        assert batch_descriptor is not None
+        entry = self._logits_entries.get(batch_descriptor)
+        if entry is None:
+            entry = _BreakableEntry(batch_descriptor=batch_descriptor)
+            self._logits_entries[batch_descriptor] = entry
+
+        if entry.capture is None:
+            return self._capture_logits(entry, graph_inputs, hidden_states, logits_indices)
+        return self._replay_logits(entry, graph_inputs, hidden_states, logits_indices)
+
+    def _capture_logits(
+        self,
+        entry: _BreakableEntry,
+        graph_inputs: list[torch.Tensor],
+        hidden_states: torch.Tensor,
+        logits_indices: torch.Tensor | None,
+    ) -> Any:
+        validate_cudagraph_capturing_enabled()
+
+        entry.input_addresses = [
+            x.data_ptr() for x in graph_inputs if isinstance(x, torch.Tensor)
+        ]
+
+        if self.graph_pool is not None:
+            set_graph_pool_id(self.graph_pool)
+        else:
+            set_graph_pool_id(current_platform.graph_pool_handle())
+
+        gc.collect()
+        torch.accelerator.empty_cache()
+        get_offloader().sync_prev_onload()
+
+        capture = BreakableCUDAGraphCapture(pool=self.graph_pool)
+        with capture:
+            hs = hidden_states[logits_indices] if logits_indices is not None else hidden_states
+            output = self.runnable.compute_logits(hs)
+            get_offloader().join_after_forward()
+            output = weak_ref_tensors(output)
+
+        entry.capture = capture
+        entry.output = weak_ref_tensors(output)
+
+        logger.debug(
+            "Captured breakable logits cudagraph for %s: %r",
+            entry.batch_descriptor,
+            capture,
+        )
+        return output
+
+    def _replay_logits(
+        self,
+        entry: _BreakableEntry,
+        graph_inputs: list[torch.Tensor],
+        hidden_states: torch.Tensor,
+        logits_indices: torch.Tensor | None,
+    ) -> Any:
+        if self.is_debugging_mode and entry.input_addresses is not None:
+            new_addresses = [
+                x.data_ptr() for x in graph_inputs if isinstance(x, torch.Tensor)
+            ]
+            assert new_addresses == entry.input_addresses, (
+                "Input tensor addresses changed between capture and replay "
+                f"for logits graph {entry.batch_descriptor}. Expected "
+                f"{entry.input_addresses}, got {new_addresses}."
+            )
         get_offloader().sync_prev_onload()
         assert entry.capture is not None
         entry.capture.replay()
