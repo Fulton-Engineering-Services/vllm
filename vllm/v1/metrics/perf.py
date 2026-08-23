@@ -1608,8 +1608,11 @@ class MambaMetrics(ComponentMetrics):
         )
         read_bytes["mamba_conv1d_input"] = T * conv_dim * self.activation_byte_size * L
 
-        # ssm state read (per token)
-        read_bytes["mamba_ssm_state_read"] = (
+        # ssm state read (per token). ssm_state_byte_size may be a float
+        # (modelopt_mixed quantisation); cast to int so the value matches
+        # the dict[str, int] return type and does not propagate a float
+        # through PerfStats -> msgspec/IPC.
+        read_bytes["mamba_ssm_state_read"] = int(
             T * I * self.ssm_state_size * self.ssm_state_byte_size * L
         )
 
@@ -1646,8 +1649,11 @@ class MambaMetrics(ComponentMetrics):
         # conv1d output writes
         write_bytes["mamba_conv1d_output"] = T * conv_dim * self.activation_byte_size * L
 
-        # ssm state write (per token)
-        write_bytes["mamba_ssm_state_write"] = (
+        # ssm state write (per token). ssm_state_byte_size may be a float
+        # (modelopt_mixed quantisation); cast to int so the value matches
+        # the dict[str, int] return type and does not propagate a float
+        # through PerfStats -> msgspec/IPC.
+        write_bytes["mamba_ssm_state_write"] = int(
             T * I * self.ssm_state_size * self.ssm_state_byte_size * L
         )
 
@@ -1884,9 +1890,9 @@ class ModelMetrics:
         read_bytes_breakdown = self.get_read_bytes_breakdown(ctx, True)
         write_bytes_breakdown = self.get_write_bytes_breakdown(ctx, True)
         perf_stats = PerfStats(
-            sum(num_flops_breakdown.values()),
-            sum(read_bytes_breakdown.values()),
-            sum(write_bytes_breakdown.values()),
+            int(sum(num_flops_breakdown.values())),
+            int(sum(read_bytes_breakdown.values())),
+            int(sum(write_bytes_breakdown.values())),
         )
 
         if envs.VLLM_DEBUG_MFU_METRICS:
