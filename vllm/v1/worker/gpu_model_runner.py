@@ -2574,7 +2574,9 @@ class GPUModelRunner(
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(
+                if not get_pp_group().is_last_rank:
+                    spec_decode_common_attn_metadata = cm
+                elif isinstance(
                     self.drafter,
                     (
                         EagleProposer,
@@ -2588,14 +2590,15 @@ class GPUModelRunner(
                 else:
                     spec_decode_common_attn_metadata = cm
             # Capture per-group block tables for multi-group proposers.
-            if self.speculative_config and isinstance(self.drafter, Step3p5MTPProposer):
-                self.drafter.set_per_group_attn_metadata(
-                    kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
-                )
-            elif self.speculative_config and isinstance(self.drafter, Gemma4Proposer):
-                self.drafter.set_per_group_block_table(
-                    kv_cache_gid, cm.block_table_tensor
-                )
+            if self.speculative_config and get_pp_group().is_last_rank:
+                if isinstance(self.drafter, Step3p5MTPProposer):
+                    self.drafter.set_per_group_attn_metadata(
+                        kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
+                    )
+                elif isinstance(self.drafter, Gemma4Proposer):
+                    self.drafter.set_per_group_block_table(
+                        kv_cache_gid, cm.block_table_tensor
+                    )
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:
