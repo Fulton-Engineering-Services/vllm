@@ -1309,6 +1309,21 @@ class SpecDecodeBaseProposer:
                 ),
             )
 
+        # The draft model is loaded only on the last PP rank (where the MTP
+        # layer lives).  fastsafetensors uses NCCL collectives (broadcast) that
+        # require ALL PP ranks to participate, but only the last rank loads
+        # draft weights — the others are not in the collective, causing a
+        # 600s NCCL timeout.  Fall back to the standard safetensors loader
+        # (no cross-rank collectives) so the last rank can load independently.
+        if base.load_config.load_format == "fastsafetensors":
+            base = replace(
+                base,
+                load_config=replace(
+                    base.load_config,
+                    load_format="safetensors",
+                ),
+            )
+
         return base
 
     def _get_model(self) -> nn.Module:
