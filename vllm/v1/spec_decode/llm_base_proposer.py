@@ -521,6 +521,7 @@ class SpecDecodeBaseProposer:
     ) -> torch.Tensor:
         self.num_speculative_tokens = num_speculative_tokens
         self._last_draft_probs = None
+        torch.cuda.set_sync_debug_mode("warn")
         batch_size = common_attn_metadata.batch_size()
 
         if self.method in ("eagle3", "dflash"):
@@ -565,6 +566,29 @@ class SpecDecodeBaseProposer:
         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
             num_tokens, num_input_tokens, mm_embed_inputs
         )
+        # MTP-DEBUG: assert draft-forward inputs are in-bounds so the OOB
+        # gather is caught at the Python level with exact values.
+        _vocab = self.draft_model_config.get_vocab_size()
+        _ids = model_kwargs.get("input_ids")
+        if _ids is not None:
+            _bad = (_ids < 0) | (_ids >= _vocab)
+            if bool(_bad.any()):
+                _pos = _bad.nonzero().flatten()[:20].tolist()
+                raise RuntimeError(
+                    f"[MTP-DEBUG] OOB input_ids: values={_ids[_pos].tolist()} "
+                    f"at={_pos} num_tokens={num_tokens} "
+                    f"num_input_tokens={num_input_tokens} vocab={_vocab} "
+                    f"batch_size={batch_size}"
+                )
+        _pos_ids = model_kwargs.get("positions")
+        if _pos_ids is not None:
+            _badp = (_pos_ids < 0) | (_pos_ids >= self.max_positions)
+            if bool(_badp.any()):
+                _ppos = _badp.nonzero().flatten()[:20].tolist()
+                raise RuntimeError(
+                    f"[MTP-DEBUG] OOB positions: values={_pos_ids[_ppos].tolist()} "
+                    f"at={_ppos} max_positions={self.max_positions}"
+                )
         # Step 0 of index_share_for_mtp_iteration: let the MTP layer
         # compute its own indices (skip_topk=False) so subsequent steps
         # can reuse them.
@@ -602,6 +626,15 @@ class SpecDecodeBaseProposer:
             # batch. Compact the topk indices for each request's last token.
             self.model.model.compact_topk_indices(token_indices_to_sample)
 
+        _tii = token_indices_to_sample
+        _nrows = last_hidden_states.shape[0]
+        if _tii is not None and bool((_tii < 0).any() or (_tii >= _nrows).any()):
+            _badii = _tii[(_tii < 0) | (_tii >= _nrows)][:20].tolist()
+            raise RuntimeError(
+                f"[MTP-DEBUG] OOB token_indices_to_sample: values={_badii} "
+                f"nrows={_nrows} num_tokens={num_tokens} "
+                f"num_input_tokens={num_input_tokens} batch_size={batch_size}"
+            )
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
 
         # No draft tokens requested (e.g. Dynamic SD decided K=0).
