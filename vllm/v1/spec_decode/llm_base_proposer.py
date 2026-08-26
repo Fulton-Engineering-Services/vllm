@@ -566,29 +566,6 @@ class SpecDecodeBaseProposer:
         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
             num_tokens, num_input_tokens, mm_embed_inputs
         )
-        # MTP-DEBUG: assert draft-forward inputs are in-bounds so the OOB
-        # gather is caught at the Python level with exact values.
-        _vocab = self.draft_model_config.get_vocab_size()
-        _ids = model_kwargs.get("input_ids")
-        if _ids is not None:
-            _bad = (_ids < 0) | (_ids >= _vocab)
-            if bool(_bad.any()):
-                _pos = _bad.nonzero().flatten()[:20].tolist()
-                raise RuntimeError(
-                    f"[MTP-DEBUG] OOB input_ids: values={_ids[_pos].tolist()} "
-                    f"at={_pos} num_tokens={num_tokens} "
-                    f"num_input_tokens={num_input_tokens} vocab={_vocab} "
-                    f"batch_size={batch_size}"
-                )
-        _pos_ids = model_kwargs.get("positions")
-        if _pos_ids is not None:
-            _badp = (_pos_ids < 0) | (_pos_ids >= self.max_positions)
-            if bool(_badp.any()):
-                _ppos = _badp.nonzero().flatten()[:20].tolist()
-                raise RuntimeError(
-                    f"[MTP-DEBUG] OOB positions: values={_pos_ids[_ppos].tolist()} "
-                    f"at={_ppos} max_positions={self.max_positions}"
-                )
         # Step 0 of index_share_for_mtp_iteration: let the MTP layer
         # compute its own indices (skip_topk=False) so subsequent steps
         # can reuse them.
