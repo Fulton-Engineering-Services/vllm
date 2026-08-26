@@ -1166,6 +1166,19 @@ class SpecDecodeBaseProposer:
             num_reqs,
         )
 
+        # MTP-DEBUG: dump full kernel inputs when the index goes negative.
+        if bool((token_indices_to_sample < 0).any()):
+            raise RuntimeError(
+                "[MTP-DEBUG] negative token_indices_to_sample in "
+                "prepare_inputs_padded: "
+                f"indices={token_indices_to_sample.tolist()} "
+                f"query_start_loc={common_attn_metadata.query_start_loc.tolist()} "
+                f"cu_num_draft_tokens={spec_decode_metadata.cu_num_draft_tokens.tolist()} "
+                f"valid_sampled_tokens_count={valid_sampled_tokens_count.tolist()} "
+                f"num_rejected={num_rejected_tokens_gpu.tolist()} "
+                f"num_reqs={num_reqs}"
+            )
+
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         new_query_len_per_req = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
