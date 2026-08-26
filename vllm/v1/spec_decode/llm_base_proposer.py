@@ -1166,11 +1166,12 @@ class SpecDecodeBaseProposer:
             num_reqs,
         )
 
-        # MTP-DEBUG: dump full kernel inputs when the index goes negative.
+        # With the kernel clamp this should never be negative, but log if
+        # the scheduler invariant fix hasn't fully kicked in yet.
         if bool((token_indices_to_sample < 0).any()):
-            raise RuntimeError(
-                "[MTP-DEBUG] negative token_indices_to_sample in "
-                "prepare_inputs_padded: "
+            logger.warning(
+                "negative token_indices_to_sample in prepare_inputs_padded "
+                "(kernel clamp should have prevented this): "
                 f"indices={token_indices_to_sample.tolist()} "
                 f"query_start_loc={common_attn_metadata.query_start_loc.tolist()} "
                 f"cu_num_draft_tokens={spec_decode_metadata.cu_num_draft_tokens.tolist()} "

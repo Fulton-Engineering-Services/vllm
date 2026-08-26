@@ -513,6 +513,18 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            # With PP batch-queue run-ahead, update_draft_token_ids (post_step)
+            # can set spec_token_ids from a completed step before
+            # update_from_output for that step has rolled back the optimistic
+            # num_computed_tokens advance.  When that happens,
+            # num_computed_tokens == num_tokens (diff 0 instead of 1), so
+            # num_new_tokens == len(spec_token_ids) — one short of the
+            # required k+1 (verified + spec).  Clamp num_computed_tokens back
+            # to num_tokens - 1 so the verified token is always included.
+            if (request.spec_token_ids
+                    and request.num_computed_tokens >= request.num_tokens):
+                request.num_computed_tokens = request.num_tokens - 1
+
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders

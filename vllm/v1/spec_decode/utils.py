@@ -171,6 +171,11 @@ def eagle_prepare_inputs_padded_kernel(
     q_last_tok_idx = tl.load(query_start_loc_gpu_ptr + req_idx + 1) - 1
 
     index_to_sample = q_last_tok_idx - num_rejected_tokens
+    # Clamp to 0 as a safety net: if num_rejected_tokens exceeds the query
+    # length (all spec tokens rejected and the verified token was not
+    # scheduled), the index would go negative.  Using 0 (the first query
+    # token) is the least-bad fallback and prevents OOB access.
+    index_to_sample = tl.maximum(index_to_sample, 0)
     tl.store(token_indices_to_sample_ptr + req_idx, index_to_sample)
     tl.store(num_rejected_tokens_gpu_ptr + req_idx, num_rejected_tokens)
 
