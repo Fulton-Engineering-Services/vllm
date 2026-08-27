@@ -922,7 +922,14 @@ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm
 # UCCL-EP uses CPU proxy threads + ibv_reg_mr_iova2 instead, which works on GB10.
 # deep-ep is a pure-Python shim that wraps uccl.ep and exposes the same Buffer API
 # that vLLM's DeepEPLLAll2AllManager / DeepEPHTAll2AllManager import.
+#
+# The EP kernels wheel above installs the original deep_ep (DeepSeek, DMA-BUF).
+# uv will not downgrade a package, so we must explicitly uninstall it first
+# before installing the UCCL-EP replacement (which uses the same deep_ep name).
+# uccl.ep links against libibverbs; the runtime lib is already in the image via
+# the libibverbs-dev and libnuma-dev packages in the vllm-base stage.
 RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip uninstall --system deep_ep || true && \
     uv pip install --system deep-ep uccl \
         --index-url https://fulton-engineering-services.github.io/dgx-spark-wheels/simple/ --extra-index-url https://pypi.org/simple
 
