@@ -924,13 +924,12 @@ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm
 # that vLLM's DeepEPLLAll2AllManager / DeepEPHTAll2AllManager import.
 #
 # The EP kernels wheel above installs the original deep_ep (DeepSeek, DMA-BUF).
-# uv will not downgrade a package, so we must explicitly uninstall it first
-# before installing the UCCL-EP replacement (which uses the same deep_ep name).
-# uccl.ep links against libibverbs; the runtime lib is already in the image via
-# the libibverbs-dev and libnuma-dev packages in the vllm-base stage.
+# uv --force-reinstall can't match the index name "deep-ep" to the installed
+# package "deep_ep", so remove it with pip first, then install the UCCL-EP
+# replacement (which ships as the same deep_ep package name).
 RUN --mount=type=cache,target=/opt/uv/cache \
-    uv pip uninstall --system deep_ep || true && \
-    uv pip install --system deep-ep uccl \
+    python3 -m pip uninstall -y deep_ep || true && \
+    uv pip install --system --no-deps deep-ep uccl \
         --index-url https://fulton-engineering-services.github.io/dgx-spark-wheels/simple/ --extra-index-url https://pypi.org/simple
 
 # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
