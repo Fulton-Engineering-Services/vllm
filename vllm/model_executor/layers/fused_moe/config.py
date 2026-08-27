@@ -6,8 +6,8 @@ from typing import Union
 
 import torch
 
-from vllm.config import ParallelConfig, SchedulerConfig
 import vllm.envs as envs
+from vllm.config import ParallelConfig, SchedulerConfig
 from vllm.config.kernel import MoEBackend
 from vllm.distributed import get_dp_group, get_pcp_group, get_tensor_model_parallel_rank
 from vllm.logger import init_logger
@@ -1058,6 +1058,13 @@ class FusedMoEParallelConfig:
             or (
                 envs.VLLM_NIXL_EP_PURE_TP_EP
                 and self.all2all_backend == "nixl_ep"
+            )
+            or (
+                envs.VLLM_DEEPEP_PURE_TP_EP
+                and self.all2all_backend in (
+                    "deepep_low_latency",
+                    "deepep_high_throughput",
+                )
             )
         )
 

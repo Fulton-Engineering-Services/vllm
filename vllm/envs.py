@@ -295,6 +295,7 @@ if TYPE_CHECKING:
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_NIXL_EP_PURE_TP_EP: bool = False
+    VLLM_DEEPEP_PURE_TP_EP: bool = False
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -2025,6 +2026,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_NIXL_EP_PURE_TP_EP": lambda: bool(
         int(os.getenv("VLLM_NIXL_EP_PURE_TP_EP", "0"))
+    ),
+    "VLLM_DEEPEP_PURE_TP_EP": lambda: bool(
+        int(os.getenv("VLLM_DEEPEP_PURE_TP_EP", "0"))
     ),
     # Whether enable XPU graph on Intel GPU
     "VLLM_XPU_ENABLE_XPU_GRAPH": lambda: bool(
