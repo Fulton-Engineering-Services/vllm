@@ -693,10 +693,11 @@ class ParallelConfig:
             or self.use_sequence_parallel_moe
             or (self.enable_expert_parallel and self.prefill_context_parallel_size > 1)
             or (
-                envs.VLLM_NIXL_EP_PURE_TP_EP
+                envs.VLLM_DEEPEP_PURE_TP_EP
                 and self.enable_expert_parallel
                 and self.tensor_parallel_size > 1
-                and self.all2all_backend == "nixl_ep"
+                and self.all2all_backend
+                in ("deepep_low_latency", "deepep_high_throughput")
             )
         )
 
