@@ -917,11 +917,14 @@ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm
         --index-url https://fulton-engineering-services.github.io/dgx-spark-wheels/simple/ --extra-index-url https://pypi.org/simple
 
 # Override original DeepEP with UCCL-EP drop-in (proxy-based RDMA via libibverbs).
-# GB10 lacks DMA-BUF GPU memory export (no nvidia_peermem, no IBGDA), so the
-# upstream deep_ep Buffer (which calls gpuMemGetHandleForAddressRange) segfaults.
-# UCCL-EP uses CPU proxy threads + ibv_reg_mr_iova2 instead, which works on GB10.
-# deep-ep is a pure-Python shim that wraps uccl.ep and exposes the same Buffer API
-# that vLLM's DeepEPLLAll2AllManager / DeepEPHTAll2AllManager import.
+# GB10 lacks GPU-direct RDMA support (no nvidia_peermem, no IBGDA, no DMA-BUF
+# export), so the upstream deep_ep Buffer (which calls
+# gpuMemGetHandleForAddressRange) segfaults.
+# UCCL-EP uses CPU proxy threads; the runtime probes GPU MR registration and
+# falls back to a pinned-host RDMA scratch buffer when GPU memory cannot be
+# registered. That host-alloc path works on GB10 without peermem/DMA-BUF.
+# deep-ep is a pure-Python shim that wraps uccl.ep and exposes the same Buffer
+# API that vLLM's DeepEPLLAll2AllManager / DeepEPHTAll2AllManager import.
 #
 # The EP kernels wheel above installs the original deep_ep (DeepSeek, DMA-BUF).
 # uv --force-reinstall can't match the index name "deep-ep" to the installed
@@ -929,7 +932,9 @@ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm
 # replacement (which ships as the same deep_ep package name).
 RUN --mount=type=cache,target=/opt/uv/cache \
     python3 -m pip uninstall -y deep_ep || true && \
-    uv pip install --system deep-ep==0.1.0 uccl \
+    uv pip install --system \
+        deep-ep==0.1.0+cu13.3torch2.13.glibc239 \
+        uccl==0.1.2+cu13.3torch2.13.glibc239 \
         --index-url https://fulton-engineering-services.github.io/dgx-spark-wheels/simple/ --extra-index-url https://pypi.org/simple
 
 # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
