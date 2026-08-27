@@ -487,6 +487,54 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             vllm_config, labelnames, per_engine_labelvalues
         )
 
+        # NIXL EP all2all metrics (created in frontend process so Ray
+        # metrics agent exports them; stats flow from EngineCore via
+        # SchedulerStats.nixl_ep_stats).
+        _ep_lat_buckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0]
+        _hist_ep_dispatch_lat = self._histogram_cls(
+            name="vllm:nixl_ep_dispatch_latency_seconds",
+            documentation="Latency of NIXL EP dispatch calls in seconds.",
+            buckets=_ep_lat_buckets,
+            labelnames=labelnames,
+        )
+        self.hist_nixl_ep_dispatch_latency = create_metric_per_engine(
+            _hist_ep_dispatch_lat, per_engine_labelvalues
+        )
+        _hist_ep_combine_lat = self._histogram_cls(
+            name="vllm:nixl_ep_combine_latency_seconds",
+            documentation="Latency of NIXL EP combine calls in seconds.",
+            buckets=_ep_lat_buckets,
+            labelnames=labelnames,
+        )
+        self.hist_nixl_ep_combine_latency = create_metric_per_engine(
+            _hist_ep_combine_lat, per_engine_labelvalues
+        )
+        _counter_ep_dispatch_tokens = self._counter_cls(
+            name="vllm:nixl_ep_dispatch_tokens_total",
+            documentation="Total tokens dispatched via NIXL EP all2all.",
+            labelnames=labelnames,
+        )
+        self.counter_nixl_ep_dispatch_tokens = create_metric_per_engine(
+            _counter_ep_dispatch_tokens, per_engine_labelvalues
+        )
+        _counter_ep_combine_tokens = self._counter_cls(
+            name="vllm:nixl_ep_combine_tokens_total",
+            documentation="Total tokens combined via NIXL EP all2all.",
+            labelnames=labelnames,
+        )
+        self.counter_nixl_ep_combine_tokens = create_metric_per_engine(
+            _counter_ep_combine_tokens, per_engine_labelvalues
+        )
+        _gauge_ep_active_ranks = self._gauge_cls(
+            name="vllm:nixl_ep_active_ranks",
+            documentation="Number of active NIXL EP ranks in the current config.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_nixl_ep_active_ranks = create_metric_per_engine(
+            _gauge_ep_active_ranks, per_engine_labelvalues
+        )
+
         #
         # Scheduler state
         #
@@ -1149,6 +1197,20 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
             if scheduler_stats.perf_stats is not None:
                 self.perf_metrics_prom.observe(scheduler_stats.perf_stats, engine_idx)
+
+            # NIXL EP all2all stats (drained from EngineCore via SchedulerStats)
+            if scheduler_stats.nixl_ep_stats is not None:
+                ep = scheduler_stats.nixl_ep_stats
+                for lat in ep.get("dispatch_latency", []):
+                    self.hist_nixl_ep_dispatch_latency[engine_idx].observe(lat)
+                for lat in ep.get("combine_latency", []):
+                    self.hist_nixl_ep_combine_latency[engine_idx].observe(lat)
+                for tok in ep.get("dispatch_tokens", []):
+                    self.counter_nixl_ep_dispatch_tokens[engine_idx].inc(tok)
+                for tok in ep.get("combine_tokens", []):
+                    self.counter_nixl_ep_combine_tokens[engine_idx].inc(tok)
+                for ranks in ep.get("active_ranks", []):
+                    self.gauge_nixl_ep_active_ranks[engine_idx].set(ranks)
 
             if (
                 self.kv_cache_metrics_enabled

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
 import time
+from collections import defaultdict
 
 import nixl_ep
 import torch
@@ -26,52 +27,26 @@ from vllm.v1.worker.ubatching import (
 
 logger = init_logger(__name__)
 
-# --- NIXL EP all2all Prometheus metrics -----------------------------------
-# Module-level so they survive NixlEPPrepareAndFinalize instance recreation
-# during elastic EP scale-up/down. Ray's metrics agent sanitizes the colon
-# prefix to underscore and adds the ray_ prefix, so these appear as
-# ray_vllm_nixl_ep_* in VictoriaMetrics.
-try:
-    from vllm.v1.metrics.ray_wrappers import (
-        RayCounterWrapper,
-        RayGaugeWrapper,
-        RayHistogramWrapper,
-    )
-
-    _nixl_ep_dispatch_tokens = RayCounterWrapper(
-        name="vllm:nixl_ep_dispatch_tokens_total",
-        documentation="Total tokens dispatched via NIXL EP all2all.",
-    )
-    _nixl_ep_combine_tokens = RayCounterWrapper(
-        name="vllm:nixl_ep_combine_tokens_total",
-        documentation="Total tokens combined via NIXL EP all2all.",
-    )
-    _nixl_ep_dispatch_latency = RayHistogramWrapper(
-        name="vllm:nixl_ep_dispatch_latency_seconds",
-        documentation="Latency of NIXL EP dispatch calls in seconds.",
-        buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0],
-    )
-    _nixl_ep_combine_latency = RayHistogramWrapper(
-        name="vllm:nixl_ep_combine_latency_seconds",
-        documentation="Latency of NIXL EP combine calls in seconds.",
-        buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0],
-    )
-    _nixl_ep_active_ranks = RayGaugeWrapper(
-        name="vllm:nixl_ep_active_ranks",
-        documentation="Number of active NIXL EP ranks in the current config.",
-    )
-except ImportError:
-    _nixl_ep_dispatch_tokens = None
-    _nixl_ep_combine_tokens = None
-    _nixl_ep_dispatch_latency = None
-    _nixl_ep_combine_latency = None
-    _nixl_ep_active_ranks = None
-
 # NIXL EP kernels quantize dispatch inputs in 128 element chunks.
 NIXL_EP_QUANT_BLOCK_SIZE = 128
 NIXL_EP_QUANT_BLOCK_SHAPE = [NIXL_EP_QUANT_BLOCK_SIZE, NIXL_EP_QUANT_BLOCK_SIZE]
 NIXL_EP_TOPK_INDICES_DTYPE = getattr(nixl_ep, "topk_idx_t", torch.int64)
 assert isinstance(NIXL_EP_TOPK_INDICES_DTYPE, torch.dtype)
+
+# Module-level accumulator for EP stats from all NixlEPPrepareAndFinalize
+# instances. Drained by the scheduler's make_stats() and sent to the
+# frontend via SchedulerStats.nixl_ep_stats, where PrometheusStatLogger
+# records them as Ray metrics (which the Ray metrics agent exports).
+_ep_stats_accumulator: dict[str, list[float]] = defaultdict(list)
+
+
+def drain_nixl_ep_stats() -> dict[str, list[float]] | None:
+    """Drain accumulated NIXL EP all2all stats. Called by the scheduler."""
+    if not _ep_stats_accumulator:
+        return None
+    stats = dict(_ep_stats_accumulator)
+    _ep_stats_accumulator.clear()
+    return stats
 
 
 def dequant_fp8(
@@ -152,6 +127,10 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # activation scales in a packed ue8m0 format during object construction
         # time. This setting is handled by post_init_setup.
         self.use_ue8m0_dispatch = False
+
+        # --- EP stats accumulation (collected in EngineCore, drained by
+        # scheduler.make_stats() and sent to frontend via SchedulerStats) ---
+        self._ep_stats = _ep_stats_accumulator
 
     def post_init_setup(self, fused_experts: mk.FusedMoEExperts):
         if not fused_experts.supports_packed_ue8m0_act_scales():
@@ -318,10 +297,9 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             async_finish=False,
             return_recv_hook=True,
         )
-        if _nixl_ep_dispatch_latency is not None:
-            _nixl_ep_dispatch_latency.observe(time.perf_counter() - _t0)
-            _nixl_ep_dispatch_tokens.inc(a1.size(0))
-            _nixl_ep_active_ranks.set(num_experts)
+        self._ep_stats["dispatch_latency"].append(time.perf_counter() - _t0)
+        self._ep_stats["dispatch_tokens"].append(float(a1.size(0)))
+        self._ep_stats["active_ranks"].append(float(num_experts))
         self.handles[a2a_idx] = handle
 
         return (
@@ -417,9 +395,8 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             return_recv_hook=do_recv_hook,
             out=output,
         )
-        if _nixl_ep_combine_latency is not None:
-            _nixl_ep_combine_latency.observe(time.perf_counter() - _t0)
-            _nixl_ep_combine_tokens.inc(fused_expert_output.size(0))
+        self._ep_stats["combine_latency"].append(time.perf_counter() - _t0)
+        self._ep_stats["combine_tokens"].append(float(fused_expert_output.size(0)))
 
         return recv_hook, lambda: None
 
@@ -460,3 +437,8 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             weight_and_reduce_impl,
             do_async=False,
         )
+
+    def drain_ep_stats(self) -> dict[str, list[float]] | None:
+        """Drain accumulated EP stats for the scheduler to include in
+        SchedulerStats. Returns None if no stats have been collected."""
+        return drain_nixl_ep_stats()
