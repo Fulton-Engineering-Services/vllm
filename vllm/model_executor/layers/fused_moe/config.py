@@ -7,6 +7,7 @@ from typing import Union
 import torch
 
 from vllm.config import ParallelConfig, SchedulerConfig
+import vllm.envs as envs
 from vllm.config.kernel import MoEBackend
 from vllm.distributed import get_dp_group, get_pcp_group, get_tensor_model_parallel_rank
 from vllm.logger import init_logger
@@ -1051,7 +1052,13 @@ class FusedMoEParallelConfig:
     @property
     def use_all2all_kernels(self):
         return self.use_ep and (
-            self.dp_size > 1 or self.pcp_size > 1 or self.is_sequence_parallel
+            self.dp_size > 1
+            or self.pcp_size > 1
+            or self.is_sequence_parallel
+            or (
+                envs.VLLM_NIXL_EP_PURE_TP_EP
+                and self.all2all_backend == "nixl_ep"
+            )
         )
 
     @property
