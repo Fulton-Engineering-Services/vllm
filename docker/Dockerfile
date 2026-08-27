@@ -929,7 +929,7 @@ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm
 # replacement (which ships as the same deep_ep package name).
 RUN --mount=type=cache,target=/opt/uv/cache \
     python3 -m pip uninstall -y deep_ep || true && \
-    uv pip install --system --no-deps deep-ep uccl \
+    uv pip install --system deep-ep==0.1.0 uccl \
         --index-url https://fulton-engineering-services.github.io/dgx-spark-wheels/simple/ --extra-index-url https://pypi.org/simple
 
 # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
