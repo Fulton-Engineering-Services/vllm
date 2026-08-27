@@ -2516,13 +2516,13 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
-        # Drain NIXL EP all2all stats accumulated during the forward pass.
-        nixl_ep_stats = None
+        # Drain EP all2all stats accumulated during the forward pass.
+        ep_all2all_stats = None
         try:
-            from vllm.model_executor.layers.fused_moe.prepare_finalize.nixl_ep import (
-                drain_nixl_ep_stats,
+            from vllm.model_executor.layers.fused_moe.prepare_finalize.ep_stats import (
+                drain_ep_all2all_stats,
             )
-            nixl_ep_stats = drain_nixl_ep_stats()
+            ep_all2all_stats = drain_ep_all2all_stats()
         except ImportError:
             pass
         return SchedulerStats(
@@ -2535,7 +2535,7 @@ class Scheduler(SchedulerInterface):
             kv_cache_eviction_events=eviction_events,
             spec_decoding_stats=spec_stats,
             kv_connector_stats=connector_stats_payload,
-            nixl_ep_stats=nixl_ep_stats,
+            ep_all2all_stats=ep_all2all_stats,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
         )

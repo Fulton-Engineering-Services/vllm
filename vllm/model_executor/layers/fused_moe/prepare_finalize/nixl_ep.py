@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable
 import time
-from collections import defaultdict
+from collections.abc import Callable
 
 import nixl_ep
 import torch
@@ -12,6 +11,10 @@ from vllm.distributed import get_ep_group
 from vllm.distributed.device_communicators.all2all import NixlEPAll2AllManager
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.prepare_finalize.ep_stats import (
+    init_ep_all2all_stats,
+    record_ep_all2all_stats,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
@@ -32,21 +35,6 @@ NIXL_EP_QUANT_BLOCK_SIZE = 128
 NIXL_EP_QUANT_BLOCK_SHAPE = [NIXL_EP_QUANT_BLOCK_SIZE, NIXL_EP_QUANT_BLOCK_SIZE]
 NIXL_EP_TOPK_INDICES_DTYPE = getattr(nixl_ep, "topk_idx_t", torch.int64)
 assert isinstance(NIXL_EP_TOPK_INDICES_DTYPE, torch.dtype)
-
-# Module-level accumulator for EP stats from all NixlEPPrepareAndFinalize
-# instances. Drained by the scheduler's make_stats() and sent to the
-# frontend via SchedulerStats.nixl_ep_stats, where PrometheusStatLogger
-# records them as Ray metrics (which the Ray metrics agent exports).
-_ep_stats_accumulator: dict[str, list[float]] = defaultdict(list)
-
-
-def drain_nixl_ep_stats() -> dict[str, list[float]] | None:
-    """Drain accumulated NIXL EP all2all stats. Called by the scheduler."""
-    if not _ep_stats_accumulator:
-        return None
-    stats = dict(_ep_stats_accumulator)
-    _ep_stats_accumulator.clear()
-    return stats
 
 
 def dequant_fp8(
@@ -128,9 +116,14 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # time. This setting is handled by post_init_setup.
         self.use_ue8m0_dispatch = False
 
-        # --- EP stats accumulation (collected in EngineCore, drained by
-        # scheduler.make_stats() and sent to frontend via SchedulerStats) ---
-        self._ep_stats = _ep_stats_accumulator
+        # Register this backend with the shared EP all2all stats accumulator.
+        try:
+            all2all_manager = get_ep_group().device_communicator.all2all_manager
+            if not isinstance(all2all_manager, NixlEPAll2AllManager):
+                all2all_manager = None
+        except Exception:
+            all2all_manager = None
+        init_ep_all2all_stats("nixl_ep", all2all_manager)
 
     def post_init_setup(self, fused_experts: mk.FusedMoEExperts):
         if not fused_experts.supports_packed_ue8m0_act_scales():
@@ -297,9 +290,9 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             async_finish=False,
             return_recv_hook=True,
         )
-        self._ep_stats["dispatch_latency"].append(time.perf_counter() - _t0)
-        self._ep_stats["dispatch_tokens"].append(float(a1.size(0)))
-        self._ep_stats["active_ranks"].append(float(num_experts))
+        record_ep_all2all_stats("dispatch_latency", time.perf_counter() - _t0)
+        record_ep_all2all_stats("dispatch_tokens", float(a1.size(0)))
+        record_ep_all2all_stats("active_ranks", float(num_experts))
         self.handles[a2a_idx] = handle
 
         return (
@@ -395,8 +388,10 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             return_recv_hook=do_recv_hook,
             out=output,
         )
-        self._ep_stats["combine_latency"].append(time.perf_counter() - _t0)
-        self._ep_stats["combine_tokens"].append(float(fused_expert_output.size(0)))
+        record_ep_all2all_stats("combine_latency", time.perf_counter() - _t0)
+        record_ep_all2all_stats(
+            "combine_tokens", float(fused_expert_output.size(0))
+        )
 
         return recv_hook, lambda: None
 
@@ -437,8 +432,3 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             weight_and_reduce_impl,
             do_async=False,
         )
-
-    def drain_ep_stats(self) -> dict[str, list[float]] | None:
-        """Drain accumulated EP stats for the scheduler to include in
-        SchedulerStats. Returns None if no stats have been collected."""
-        return drain_nixl_ep_stats()
