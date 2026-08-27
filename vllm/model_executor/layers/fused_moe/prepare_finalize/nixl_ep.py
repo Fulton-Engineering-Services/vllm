@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+import time
 
 import nixl_ep
 import torch
@@ -24,6 +25,47 @@ from vllm.v1.worker.ubatching import (
 )
 
 logger = init_logger(__name__)
+
+# --- NIXL EP all2all Prometheus metrics -----------------------------------
+# Module-level so they survive NixlEPPrepareAndFinalize instance recreation
+# during elastic EP scale-up/down. Ray's metrics agent sanitizes the colon
+# prefix to underscore and adds the ray_ prefix, so these appear as
+# ray_vllm_nixl_ep_* in VictoriaMetrics.
+try:
+    from vllm.v1.metrics.ray_wrappers import (
+        RayCounterWrapper,
+        RayGaugeWrapper,
+        RayHistogramWrapper,
+    )
+
+    _nixl_ep_dispatch_tokens = RayCounterWrapper(
+        name="vllm:nixl_ep_dispatch_tokens_total",
+        documentation="Total tokens dispatched via NIXL EP all2all.",
+    )
+    _nixl_ep_combine_tokens = RayCounterWrapper(
+        name="vllm:nixl_ep_combine_tokens_total",
+        documentation="Total tokens combined via NIXL EP all2all.",
+    )
+    _nixl_ep_dispatch_latency = RayHistogramWrapper(
+        name="vllm:nixl_ep_dispatch_latency_seconds",
+        documentation="Latency of NIXL EP dispatch calls in seconds.",
+        buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0],
+    )
+    _nixl_ep_combine_latency = RayHistogramWrapper(
+        name="vllm:nixl_ep_combine_latency_seconds",
+        documentation="Latency of NIXL EP combine calls in seconds.",
+        buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0],
+    )
+    _nixl_ep_active_ranks = RayGaugeWrapper(
+        name="vllm:nixl_ep_active_ranks",
+        documentation="Number of active NIXL EP ranks in the current config.",
+    )
+except ImportError:
+    _nixl_ep_dispatch_tokens = None
+    _nixl_ep_combine_tokens = None
+    _nixl_ep_dispatch_latency = None
+    _nixl_ep_combine_latency = None
+    _nixl_ep_active_ranks = None
 
 # NIXL EP kernels quantize dispatch inputs in 128 element chunks.
 NIXL_EP_QUANT_BLOCK_SIZE = 128
@@ -263,6 +305,7 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         # Dispatch
         dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)
+        _t0 = time.perf_counter()
         expert_x, expert_num_tokens, handle, _, hook = self.buffer.dispatch(
             a1,
             dispatch_topk_ids,
@@ -275,6 +318,10 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             async_finish=False,
             return_recv_hook=True,
         )
+        if _nixl_ep_dispatch_latency is not None:
+            _nixl_ep_dispatch_latency.observe(time.perf_counter() - _t0)
+            _nixl_ep_dispatch_tokens.inc(a1.size(0))
+            _nixl_ep_active_ranks.set(num_experts)
         self.handles[a2a_idx] = handle
 
         return (
@@ -359,6 +406,7 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         combine_topk_ids = self._map_global_to_physical_ids(topk_ids)
         # TODO (varun) : Enable zero copy mode
         dbo_maybe_run_recv_hook()
+        _t0 = time.perf_counter()
         _, _, recv_hook = self.buffer.combine(
             fused_expert_output,
             combine_topk_ids,
@@ -369,6 +417,9 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             return_recv_hook=do_recv_hook,
             out=output,
         )
+        if _nixl_ep_combine_latency is not None:
+            _nixl_ep_combine_latency.observe(time.perf_counter() - _t0)
+            _nixl_ep_combine_tokens.inc(fused_expert_output.size(0))
 
         return recv_hook, lambda: None
 
