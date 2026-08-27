@@ -250,11 +250,11 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
     ) -> tuple[Callable, mk.ReceiverType]:
-        if defer_input_quant:
-            raise NotImplementedError(
-                f"{self.__class__.__name__} does not support defer_input_quant=True. "
-                "Please select an MoE kernel that accepts quantized inputs."
-            )
+        # When defer_input_quant=True, the expert kernel expects unquantized
+        # BF16 inputs and handles quantization internally. Dispatch raw BF16
+        # data (no FP8/NVFP4 quantization before all2all) and skip _do_quant
+        # in the receiver.
+        dispatch_fp8 = self.use_fp8_dispatch and not defer_input_quant
 
         hidden_size = a1.size(1)
         assert hidden_size in self.SUPPORTED_HIDDEN_SIZES, (
@@ -264,14 +264,16 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         a2a_idx = dbo_current_ubatch_id()
 
-        if self.use_fp8_dispatch:
+        if dispatch_fp8:
             assert hidden_size % 128 == 0, (
                 "DeepEP kernels quantize the inputs in blocks of shape 128"
             )
 
         use_nvfp4 = False
         nvfp4_dispatch = (
-            quant_config.quant_dtype == "nvfp4" and envs.VLLM_DEEPEPLL_NVFP4_DISPATCH
+            not defer_input_quant
+            and quant_config.quant_dtype == "nvfp4"
+            and envs.VLLM_DEEPEPLL_NVFP4_DISPATCH
         )
         if nvfp4_dispatch:
             use_nvfp4 = True
@@ -314,9 +316,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             dispatch_topk_ids,
             self.max_tokens_per_rank,
             num_experts,
-            use_fp8=self.use_fp8_dispatch,
-            round_scale=self.use_ue8m0_dispatch,
-            use_ue8m0=self.use_ue8m0_dispatch,
+            use_fp8=dispatch_fp8,
+            round_scale=self.use_ue8m0_dispatch if dispatch_fp8 else False,
+            use_ue8m0=self.use_ue8m0_dispatch if dispatch_fp8 else False,
             **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
             **(
                 dict(x_global_scale=qc_a1_gscale_or_scale)
@@ -339,6 +341,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 quant_config.a1_scale,
                 a1.dtype,
                 quant_config,
+                defer_input_quant=defer_input_quant,
             ),
         )
 
@@ -349,8 +352,14 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         a1_scale: torch.Tensor | None,
         a1_dtype: torch.dtype,
         quant_config: FusedMoEQuantConfig,
+        defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
-        expert_x, expert_x_scale = self._do_quant(expert_x, a1_dtype, quant_config)
+        if defer_input_quant:
+            expert_x_scale = None
+        else:
+            expert_x, expert_x_scale = self._do_quant(
+                expert_x, a1_dtype, quant_config
+            )
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=expert_num_tokens, expert_num_tokens_cpu=None
@@ -369,11 +378,6 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
-        if defer_input_quant:
-            raise NotImplementedError(
-                f"{self.__class__.__name__} does not support defer_input_quant=True. "
-                "Please select an MoE kernel that accepts quantized inputs."
-            )
         hook, receiver = self.prepare_async(
             a1,
             topk_weights,
@@ -382,6 +386,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_map,
             apply_router_weight_on_input,
             quant_config,
+            defer_input_quant,
         )
         hook()
         return receiver()
