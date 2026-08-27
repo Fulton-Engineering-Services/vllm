@@ -330,6 +330,15 @@ class RoutedExperts(PluggableLayer):
         loaded_weight = loaded_weight.narrow(
             shard_dim, shard_size * tp_rank, shard_size
         )
+        # Narrow padded dimensions (e.g. when NIXL EP rounds up hidden_size
+        # the param's K-dimension is larger than the checkpoint tensor).
+        hidden_dim = self._get_hidden_dim(shard_dim, param.ndim)
+        param = self._narrow_expert_data_for_padding(
+            param,
+            loaded_weight,
+            hidden_dim=hidden_dim,
+            shard_dim=shard_dim,
+        )
         param.copy_(loaded_weight)
 
     def _load_model_weight_or_group_weight_scale(
@@ -828,11 +837,20 @@ class RoutedExperts(PluggableLayer):
             # combined into single loaded_weight, call
             # _load_combined_w13_weight_scale() to load it.
             # This is checked by comparing the hidden_out dims of the
-            # loaded_weight and the param.
+            # loaded_weight and the param.  The combined checkpoint format
+            # (w1+w3 scales in one tensor) only exists for gated MoE
+            # (is_act_and_mul=True, w13_num_shards=2).  For non-gated MoE
+            # (w13_num_shards=1) the dimension check can coincidentally
+            # pass even though the scales are not combined, which would
+            # route to a loader that does not handle padding (e.g. NIXL EP
+            # rounds up hidden_size).  Guard with is_act_and_mul.
             if "w13_weight_scale" in weight_name:
                 loaded_weight_hidden_out = loaded_weight.shape[-2]
                 param_hidden_out = param.data.shape[-2] * self.moe_config.tp_size
-                if loaded_weight_hidden_out == param_hidden_out:
+                if (
+                    loaded_weight_hidden_out == param_hidden_out
+                    and self.moe_config.is_act_and_mul
+                ):
                     self._load_combined_w13_weight_scale(
                         shard_dim=shard_dim,
                         loaded_weight=loaded_weight,
