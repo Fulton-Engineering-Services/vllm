@@ -916,6 +916,16 @@ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm
     uv pip install --system ep_kernels/dist/*.whl --verbose \
         --index-url https://fulton-engineering-services.github.io/dgx-spark-wheels/simple/ --extra-index-url https://pypi.org/simple
 
+# Override original DeepEP with UCCL-EP drop-in (proxy-based RDMA via libibverbs).
+# GB10 lacks DMA-BUF GPU memory export (no nvidia_peermem, no IBGDA), so the
+# upstream deep_ep Buffer (which calls gpuMemGetHandleForAddressRange) segfaults.
+# UCCL-EP uses CPU proxy threads + ibv_reg_mr_iova2 instead, which works on GB10.
+# deep-ep is a pure-Python shim that wraps uccl.ep and exposes the same Buffer API
+# that vLLM's DeepEPLLAll2AllManager / DeepEPHTAll2AllManager import.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --system deep-ep uccl \
+        --index-url https://fulton-engineering-services.github.io/dgx-spark-wheels/simple/ --extra-index-url https://pypi.org/simple
+
 # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
 # return to /usr/local/nvidia in 13.0 to allow container providers to mount drivers
 # consistently from the host (see https://github.com/vllm-project/vllm/issues/18859).
