@@ -105,6 +105,7 @@ if TYPE_CHECKING:
     CMAKE_BUILD_TYPE: Literal["Debug", "Release", "RelWithDebInfo"] | None = None
     VERBOSE: bool = False
     VLLM_ALLOW_LONG_MAX_MODEL_LEN: bool = False
+    VLLM_GPU_MEMORY_UTILIZATION_CHECK_ONLY_WARN: bool = False
     VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 5  # seconds
     VLLM_MAX_N_SEQUENCES: int = 16384
     VLLM_MAX_COMPLETION_PROMPTS: int = 1024
@@ -1066,6 +1067,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # To enable this, set VLLM_ALLOW_LONG_MAX_MODEL_LEN=1.
     "VLLM_ALLOW_LONG_MAX_MODEL_LEN": lambda: (
         os.environ.get("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "0").strip().lower()
+        in ("1", "true")
+    ),
+    # If set, request_memory() logs a warning instead of raising ValueError
+    # when free memory < gpu_memory_utilization × total. Useful on unified-
+    # memory SoCs (e.g. GB10) where FlexTensor NVMe offload will evict weights
+    # post-load, shrinking the footprint before KV cache sizing.
+    "VLLM_GPU_MEMORY_UTILIZATION_CHECK_ONLY_WARN": lambda: (
+        os.environ.get("VLLM_GPU_MEMORY_UTILIZATION_CHECK_ONLY_WARN", "0")
+        .strip()
+        .lower()
         in ("1", "true")
     ),
     # If set, forces FP8 Marlin to be used for FP8 quantization regardless
@@ -2189,6 +2200,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
         "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH",
+        "VLLM_GPU_MEMORY_UTILIZATION_CHECK_ONLY_WARN",
         "VLLM_IMAGE_FETCH_TIMEOUT",
         "VLLM_VIDEO_FETCH_TIMEOUT",
         "VLLM_AUDIO_FETCH_TIMEOUT",
