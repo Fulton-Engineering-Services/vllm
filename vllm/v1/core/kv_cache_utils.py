@@ -1522,7 +1522,11 @@ def _promote_local_kv_cache_specs(
                     page_size_padded=promoted_page_size_padded(spec, block_size),
                 )
 
-    if not (
+    non_attention_types = (MambaSpec, HiddenStateCacheSpec)
+    has_non_attention = any(
+        isinstance(spec, non_attention_types) for spec in promoted_specs.values()
+    )
+    if not has_non_attention and not (
         is_kv_cache_spec_uniform(promoted_specs)
         or UniformTypeKVCacheSpecs.is_uniform_type(promoted_specs)
     ):
