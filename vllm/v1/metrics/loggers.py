@@ -486,10 +486,6 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.perf_metrics_prom = self._perf_metrics_cls(
             vllm_config, labelnames, per_engine_labelvalues
         )
-
-        #
-        # Scheduler state
-        #
         gauge_scheduler_running = self._gauge_cls(
             name="vllm:num_requests_running",
             documentation="Number of requests in model execution batches.",

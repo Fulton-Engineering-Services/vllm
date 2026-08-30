@@ -13,6 +13,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
+from vllm.compilation import monitor
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
@@ -205,6 +206,15 @@ class CUDAGraphWrapper:
         # the entries for different batch descriptors that we need to capture
         # cudagraphs for.
         self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry] = {}
+        # Separate cache for the LM-head logits GEMM. Keyed by the same
+        # BatchDescriptor as the forward graph but stored apart so the
+        # forward and logits graphs don't collide.  This lets
+        # compute_logits() be captured/replayed through the graph instead
+        # of running eagerly after the forward replay (nsys 2026-08-21:
+        # 5.7 ms eager LM-head GEMM + 0.7 ms idle per decode step).
+        self._logits_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry] = (
+            {}
+        )
 
         CUDAGraphWrapper._all_instances.add(self)
 
@@ -229,6 +239,7 @@ class CUDAGraphWrapper:
 
     def clear_graphs(self) -> None:
         self.concrete_cudagraph_entries.clear()
+        self._logits_cudagraph_entries.clear()
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any | None:
         if not is_forward_context_available():
@@ -263,6 +274,10 @@ class CUDAGraphWrapper:
         entry = self.concrete_cudagraph_entries[batch_descriptor]
 
         if entry.cudagraph is None:
+            if not monitor.cudagraph_capturing_enabled:
+                # Warmup is past; lazy-capture is disabled — fall back to
+                # eager execution rather than raising RuntimeError.
+                return self.runnable(*args, **kwargs)
             if self.cudagraph_options.debug_log_enable:
                 # Since we capture cudagraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
@@ -356,6 +371,122 @@ class CUDAGraphWrapper:
 
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.
+        get_offloader().sync_prev_onload()
+        entry.cudagraph.replay()
+        return entry.output
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        logits_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Capture/replay the LM-head logits GEMM through the cudagraph.
+
+        Mirrors ``__call__`` dispatch but for ``runnable.compute_logits``
+        instead of ``runnable.__call__``.  This eliminates the ~5.7 ms
+        eager LM-head GEMM + 0.7 ms idle gap that runs outside the forward
+        graph during decode (nsys 2026-08-21).  The logits projection is
+        graph-capturable: vocab_size is static and only the padded batch
+        dimension varies, which is encoded in the BatchDescriptor key.
+
+        When ``logits_indices`` is provided, the indexing
+        ``hidden_states[logits_indices]`` is captured *inside* the graph so
+        that both inputs are persistent GPU buffers with stable addresses
+        (the indexing result itself is not a stable buffer).  When
+        ``logits_indices`` is None the caller has already produced the
+        correct slice (eager path — prompt logprobs, dummy run).
+
+        Must be called inside a ``set_forward_context`` block (same as
+        ``__call__``) so the cudagraph_runtime_mode and batch_descriptor
+        are available for dispatch.
+        """
+        # Build the list of graph-input tensors for address tracking.
+        graph_inputs = [hidden_states]
+        if logits_indices is not None:
+            graph_inputs.append(logits_indices)
+
+        if not is_forward_context_available():
+            hs = hidden_states[logits_indices] if logits_indices is not None else hidden_states
+            return self.runnable.compute_logits(hs)
+
+        forward_context = get_forward_context()
+        batch_descriptor = forward_context.batch_descriptor
+        cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
+
+        if (
+            cudagraph_runtime_mode == CUDAGraphMode.NONE
+            or cudagraph_runtime_mode != self.runtime_mode
+        ):
+            hs = hidden_states[logits_indices] if logits_indices is not None else hidden_states
+            return self.runnable.compute_logits(hs)
+
+        assert batch_descriptor is not None
+        if batch_descriptor not in self._logits_cudagraph_entries:
+            entry = CUDAGraphEntry(batch_descriptor=batch_descriptor)
+            self._logits_cudagraph_entries[batch_descriptor] = entry
+        else:
+            entry = self._logits_cudagraph_entries[batch_descriptor]
+
+        if entry.cudagraph is None:
+            if not monitor.cudagraph_capturing_enabled:
+                # Warmup is past; lazy-capture is disabled — fall back to
+                # eager execution rather than raising RuntimeError.
+                hs = hidden_states[logits_indices] if logits_indices is not None else hidden_states
+                return self.runnable.compute_logits(hs)
+            validate_cudagraph_capturing_enabled()
+
+            input_addresses = [
+                x.data_ptr() for x in graph_inputs if isinstance(x, torch.Tensor)
+            ]
+            entry.input_addresses = input_addresses
+            cudagraph = torch.cuda.CUDAGraph()
+
+            with ExitStack() as stack:
+                if self.cudagraph_options.gc_disable:
+                    stack.enter_context(
+                        patch("gc.collect", lambda *args, **kwargs: None)
+                    )
+                    stack.enter_context(
+                        patch(
+                            "torch.accelerator.empty_cache",
+                            lambda *args, **kwargs: None,
+                        )
+                    )
+
+                if self.graph_pool is not None:
+                    set_graph_pool_id(self.graph_pool)
+                else:
+                    set_graph_pool_id(current_platform.graph_pool_handle())
+
+                get_offloader().sync_prev_onload()
+
+                with torch.cuda.graph(
+                    cudagraph,
+                    pool=self.graph_pool,
+                    stream=current_stream(),
+                ):
+                    hs = hidden_states[logits_indices] if logits_indices is not None else hidden_states
+                    output = self.runnable.compute_logits(hs)
+                    get_offloader().join_after_forward()
+                    if self.cudagraph_options.weak_ref_output:
+                        output = weak_ref_tensors(output)
+
+            entry.output = weak_ref_tensors(output)
+            entry.cudagraph = cudagraph
+
+            compilation_counter.num_cudagraph_captured += 1
+            return output
+
+        if self.is_debugging_mode:
+            new_input_addresses = [
+                x.data_ptr() for x in graph_inputs if isinstance(x, torch.Tensor)
+            ]
+            assert new_input_addresses == entry.input_addresses, (
+                f"Input addresses for logits cudagraphs are different "
+                f"during replay. Expected {entry.input_addresses}, "
+                f"got {new_input_addresses}"
+            )
+
         get_offloader().sync_prev_onload()
         entry.cudagraph.replay()
         return entry.output

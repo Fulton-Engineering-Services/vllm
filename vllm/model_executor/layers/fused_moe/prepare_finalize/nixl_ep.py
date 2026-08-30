@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Callable
 
 import nixl_ep
@@ -10,6 +11,10 @@ from vllm.distributed import get_ep_group
 from vllm.distributed.device_communicators.all2all import NixlEPAll2AllManager
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.prepare_finalize.ep_stats import (
+    init_ep_all2all_stats,
+    record_ep_all2all_stats,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
@@ -110,6 +115,15 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # activation scales in a packed ue8m0 format during object construction
         # time. This setting is handled by post_init_setup.
         self.use_ue8m0_dispatch = False
+
+        # Register this backend with the shared EP all2all stats accumulator.
+        try:
+            all2all_manager = get_ep_group().device_communicator.all2all_manager
+            if not isinstance(all2all_manager, NixlEPAll2AllManager):
+                all2all_manager = None
+        except Exception:
+            all2all_manager = None
+        init_ep_all2all_stats("nixl_ep", all2all_manager)
 
     def post_init_setup(self, fused_experts: mk.FusedMoEExperts):
         if not fused_experts.supports_packed_ue8m0_act_scales():
@@ -263,6 +277,7 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         # Dispatch
         dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)
+        _t0 = time.perf_counter()
         expert_x, expert_num_tokens, handle, _, hook = self.buffer.dispatch(
             a1,
             dispatch_topk_ids,
@@ -275,6 +290,9 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             async_finish=False,
             return_recv_hook=True,
         )
+        record_ep_all2all_stats("dispatch_latency", time.perf_counter() - _t0)
+        record_ep_all2all_stats("dispatch_tokens", float(a1.size(0)))
+        record_ep_all2all_stats("active_ranks", float(num_experts))
         self.handles[a2a_idx] = handle
 
         return (
@@ -359,6 +377,7 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         combine_topk_ids = self._map_global_to_physical_ids(topk_ids)
         # TODO (varun) : Enable zero copy mode
         dbo_maybe_run_recv_hook()
+        _t0 = time.perf_counter()
         _, _, recv_hook = self.buffer.combine(
             fused_expert_output,
             combine_topk_ids,
@@ -368,6 +387,10 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             zero_copy=False,
             return_recv_hook=do_recv_hook,
             out=output,
+        )
+        record_ep_all2all_stats("combine_latency", time.perf_counter() - _t0)
+        record_ep_all2all_stats(
+            "combine_tokens", float(fused_expert_output.size(0))
         )
 
         return recv_hook, lambda: None

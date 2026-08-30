@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Callable
 
 import deep_ep
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.distributed import get_ep_group
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.prepare_finalize.ep_stats import (
+    init_ep_all2all_stats,
+    record_ep_all2all_stats,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
     TopKWeightAndReduceDelegate,
@@ -69,6 +75,13 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         # From https://github.com/deepseek-ai/DeepEP/blob/9fe9021f29c9083cd1808ab36b740208524d9f63/deep_ep/buffer.py#L164
         self.available_rank_configs = [2, 4, 8, 16, 24, 32, 64, 128, 144, 160]
+
+        # Register this backend with the shared EP all2all stats accumulator.
+        try:
+            all2all_manager = get_ep_group().device_communicator.all2all_manager
+        except Exception:
+            all2all_manager = None
+        init_ep_all2all_stats("deepep_ht", all2all_manager)
 
     def _sync_dbo_comm_if_needed(self) -> None:
         if self.sync_dbo_comm and dbo_enabled():
@@ -145,6 +158,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if has_scales:
             token_data = (tokens, token_scales)
 
+        _t0 = time.perf_counter()
         (
             token_data,
             expert_topk_ids,
@@ -169,6 +183,9 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             async_finish=self.async_prepare and not dbo_enabled(),
             allocate_on_comm_stream=False,
         )
+        record_ep_all2all_stats("dispatch_latency", time.perf_counter() - _t0)
+        record_ep_all2all_stats("dispatch_tokens", float(tokens.size(0)))
+        record_ep_all2all_stats("active_ranks", float(num_experts))
 
         self._sync_dbo_comm_if_needed()
 
@@ -375,6 +392,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         assert fused_expert_output.dtype == torch.bfloat16, (
             f"Expected fused_expert_output bfloat16, got {fused_expert_output.dtype}"
         )
+        _t0 = time.perf_counter()
         combined_x, _, event = self.buffer.combine(
             # HT combine only supports BF16
             x=fused_expert_output,
@@ -384,6 +402,10 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             previous_event=previous_event,
             async_finish=do_async and not dbo_enabled(),
             allocate_on_comm_stream=False,
+        )
+        record_ep_all2all_stats("combine_latency", time.perf_counter() - _t0)
+        record_ep_all2all_stats(
+            "combine_tokens", float(fused_expert_output.size(0))
         )
 
         self._sync_dbo_comm_if_needed()

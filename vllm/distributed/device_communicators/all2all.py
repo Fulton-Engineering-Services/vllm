@@ -169,6 +169,9 @@ class DeepEPAll2AllManagerBase(All2AllManagerBase):
         # This is the DeepEP default. Stick to it till we can establish
         # reasonable defaults based on profiling.
         self.num_sms = 20
+        # Buffer sizes (populated by subclasses in _make_all2all_kwargs)
+        self.num_nvl_bytes = 0
+        self.num_rdma_bytes = 0
 
     def get_handle(self, kwargs):
         raise NotImplementedError
@@ -230,6 +233,8 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
 
         assert num_rdma_bytes is not None
         assert num_qps_per_rank is not None
+        self.num_nvl_bytes = num_nvl_bytes
+        self.num_rdma_bytes = num_rdma_bytes
         # TODO: remove platform-specific logic
         # once ROCm DeepEP is updated with the latest APIs.
         kwargs = dict(
@@ -312,6 +317,8 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         )
 
         assert num_rdma_bytes is not None
+        self.num_nvl_bytes = num_nvl_bytes
+        self.num_rdma_bytes = num_rdma_bytes
         # TODO: remove platform-specific logic
         # once ROCm DeepEP is updated with the latest APIs.
         kwargs = dict(
@@ -403,6 +410,8 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         self.support_fault_tolerance = True
 
         self.max_num_ep_ranks = envs.VLLM_NIXL_EP_MAX_NUM_RANKS
+        self.num_nvl_bytes = 0
+        self.num_rdma_bytes = 0
 
     def _init_buffer(
         self,
@@ -419,6 +428,8 @@ class NixlEPAll2AllManager(All2AllManagerBase):
             num_ranks=self.max_num_ep_ranks,
             num_experts=max_num_global_experts,
         )
+        self.num_rdma_bytes = num_rdma_bytes
+        self.num_nvl_bytes = 0
         assert NixlEPAll2AllManager._buffer is None, (
             "NIXL EP buffer already initialized"
         )

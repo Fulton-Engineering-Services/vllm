@@ -541,6 +541,17 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             assert hasattr(cls, "humming_gemm_type")
             gemm_type = cls.humming_gemm_type().value.lower()
             preferred_gemm_type = get_humming_moe_gemm_type()
+
+            # BatchedExperts has only one Humming implementation
+            # (BatchedHummingGroupedExperts, GROUPED_MASKED). Don't let the
+            # env-var gemm-type preference block it when the prepare/finalize
+            # step requires the batched layout (e.g. NIXL EP all2all).
+            if (
+                cls.activation_format()
+                == mk.FusedMoEActivationFormat.BatchedExperts
+            ):
+                return True, None
+
             supported = preferred_gemm_type.lower() == gemm_type
             if not supported:
                 reason = (

@@ -236,6 +236,145 @@ def _sum_batch_bytes(sizes: list[list[int]]) -> int:
     return sum(sum(size) for size in sizes)
 
 
+def _pack_staging_chunks(
+    keys: list[str],
+    addrs: list[list[int]],
+    sizes: list[list[int]],
+    slot_size: int,
+) -> tuple[list[list[int]], list[int]]:
+    """Pack keys into chunks that fit within one slot.
+
+    Returns ``(chunks, oversized_keys)`` where each chunk is a list of
+    indices into the input lists. Oversized keys (total > slot_size) are
+    excluded from chunks and returned separately for error handling.
+    """
+    chunks: list[list[int]] = []
+    oversized: list[int] = []
+    current: list[int] = []
+    current_bytes = 0
+
+    for i in range(len(keys)):
+        key_total = sum(sizes[i])
+        if key_total > slot_size:
+            oversized.append(i)
+            continue
+        if current and current_bytes + key_total > slot_size:
+            chunks.append(current)
+            current = []
+            current_bytes = 0
+        current.append(i)
+        current_bytes += key_total
+
+    if current:
+        chunks.append(current)
+    return chunks, oversized
+
+
+def _mem_ptr(ptr: int, size: int):
+    """Wrap a raw device pointer as a cupy MemoryPointer."""
+    import cupy as cp
+    mem = cp.cuda.UnownedMemory(ptr, size, None)
+    return cp.cuda.MemoryPointer(mem, 0)
+
+
+class _StagingSlotPool:
+    """Ring of N pinned-host staging slots with per-slot CUDA streams.
+
+    Each slot owns a pinned ``torch.empty(..., pin_memory=True)`` tensor, a
+    non-blocking cupy ``Stream``, and a cupy ``Event``. Slots are claimed from
+    a ``queue.Queue`` (blocking) and returned when the slot's work is complete.
+
+    A pool of N daemon store-call threads (via ``ThreadPoolExecutor``) drives
+    per-chunk transfers: while one chunk's RDMA runs, another chunk's D2H/H2D
+    copies proceed on a different slot.
+    """
+
+    def __init__(
+        self,
+        num_slots: int,
+        slot_size_bytes: int,
+        store: Any,
+        replicate_config: Any | None,
+        direction: str,
+    ) -> None:
+        import cupy as cp
+
+        if direction not in ("put", "get"):
+            raise ValueError(f"direction must be 'put' or 'get', got {direction!r}")
+        self._num_slots = num_slots
+        self._slot_size = slot_size_bytes
+        self._store = store
+        self._replicate_config = replicate_config
+        self._direction = direction
+
+        self._slots: list[dict[str, Any]] = []
+        self._free: queue.Queue[int] = queue.Queue(maxsize=num_slots)
+
+        for i in range(num_slots):
+            buf = torch.empty(slot_size_bytes, dtype=torch.uint8, pin_memory=True)
+            base = buf.data_ptr()
+            ret = store.register_buffer(base, slot_size_bytes)
+            if ret != 0:
+                raise RuntimeError(
+                    f"Failed to register Mooncake host_staging slot {i} "
+                    f"({slot_size_bytes} bytes at {base:#x}) "
+                    f"with the store: ret={ret}"
+                )
+            stream = cp.cuda.Stream(non_blocking=True)
+            event = cp.cuda.Event()
+            self._slots.append(
+                {
+                    "buf": buf,
+                    "base": base,
+                    "size": slot_size_bytes,
+                    "stream": stream,
+                    "event": event,
+                }
+            )
+            self._free.put(i)
+
+        self._executor = ThreadPoolExecutor(
+            max_workers=num_slots,
+            thread_name_prefix=f"StagingSlotPool-{direction}",
+        )
+
+        logger.info(
+            "Mooncake host_staging %s pool: %d slots x %d MiB = %d MiB pinned",
+            direction,
+            num_slots,
+            slot_size_bytes // (1024 * 1024),
+            num_slots * slot_size_bytes // (1024 * 1024),
+        )
+
+    @property
+    def slot_size(self) -> int:
+        return self._slot_size
+
+    @property
+    def slots(self) -> list[dict[str, Any]]:
+        return self._slots
+
+    def claim(self, timeout: float = 30.0) -> int:
+        """Block until a free slot is available; return slot index.
+
+        Raises ``queue.Empty`` if no slot becomes free within *timeout*
+        seconds, so the caller can fail the chunk rather than deadlocking
+        when a store RPC hangs with all slots claimed.
+        """
+        return self._free.get(timeout=timeout)
+
+    def release(self, idx: int) -> None:
+        """Return a slot to the free pool."""
+        self._free.put(idx)
+
+    def submit(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> Future[_T]:
+        """Submit a callable to the pool executor. Returns a Future."""
+        return self._executor.submit(fn, *args, **kwargs)
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=False)
+
+
 def _get_usable_disk_offload_buffer_budget_bytes(raw_budget_bytes: int) -> int:
     return max(1, int(raw_budget_bytes * envs.VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO))
 
@@ -492,6 +631,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         enable_group_semantics: bool = False,
         supports_group_ids: bool = False,
         record_operation: Callable[..., None] | None = None,
+        host_staging: bool = False,
+        staging_put_pool: _StagingSlotPool | None = None,
     ):
         super().__init__(
             store,
@@ -526,6 +667,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
         self._skip_store_requests: set[str] = set()
+
+        self._host_staging = host_staging
+        self._put_pool = staging_put_pool
 
         # Per-request high-water mark of tokens actually persisted; the next
         # batch resumes here, so pressure-skipped or failed ranges are retried.
@@ -734,9 +878,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
         batch_bytes = _sum_batch_bytes(sizes)
         put_start = time.perf_counter()
         try:
-            res = self.store.batch_put_from_multi_buffers(
-                keys, addrs, sizes, self.replicate_config
-            )
+            if self._host_staging and self._put_pool is not None:
+                res = self._staged_put_from_multi_buffers(
+                    keys, addrs, sizes
+                )
+            else:
+                res = self.store.batch_put_from_multi_buffers(
+                    keys, addrs, sizes, self.replicate_config
+                )
         except Exception as e:
             self._record_operation(
                 "save_put",
@@ -781,6 +930,102 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 "successful partial-tail batch"
             )
         return True
+
+    def _staged_put_from_multi_buffers(
+        self, keys, addrs, sizes
+    ):
+        """Put KV data through the ring-buffer staging slot pool.
+
+        Keys are packed into chunks that fit one slot each.  Each chunk
+        claims a slot, enqueues D2H copies on the slot's stream, waits
+        for the slot's event, then does one batched store RPC for all
+        keys in the chunk.  Overlap: while one chunk's RDMA runs, the
+        next chunk's D2H copies can proceed on a different slot.
+        """
+        pool = self._put_pool
+        assert pool is not None
+        slot_size = pool.slot_size
+
+        chunks, oversized = _pack_staging_chunks(keys, addrs, sizes, slot_size)
+
+        # Submit oversized-key errors as -1 results at the right positions.
+        result_map: dict[int, list[int]] = {}
+        for idx in oversized:
+            logger.error(
+                "Key %s too large (%d bytes) for staging slot (%d bytes)",
+                keys[idx], sum(sizes[idx]), slot_size,
+            )
+            result_map[idx] = [-1]
+
+        futures: list[Future[tuple[list[int], list[int]]]] = []
+        for chunk in chunks:
+            future = pool.submit(
+                self._put_chunk, keys, addrs, sizes, chunk,
+            )
+            futures.append(future)
+
+        try:
+            for future in futures:
+                chunk_idxs, chunk_results = future.result()
+                for ci, cr in zip(chunk_idxs, chunk_results, strict=True):
+                    result_map[ci] = [cr]
+        except Exception:
+            for future in futures:
+                try:
+                    future.result()
+                except Exception:
+                    pass
+            raise
+
+        return [result_map[i][0] for i in range(len(keys))]
+
+    def _put_chunk(
+        self,
+        keys: list[str],
+        addrs: list[list[int]],
+        sizes: list[list[int]],
+        chunk_idxs: list[int],
+    ) -> tuple[list[int], list[int]]:
+        pool = self._put_pool
+        assert pool is not None
+        try:
+            slot_idx = pool.claim()
+        except queue.Empty:
+            return chunk_idxs, [-1] * len(chunk_idxs)
+        slot = pool.slots[slot_idx]
+
+        try:
+            offset = 0
+            staging_addrs: list[list[int]] = []
+            staging_sizes: list[list[int]] = []
+            chunk_keys: list[str] = []
+            for ci in chunk_idxs:
+                key_staging: list[int] = []
+                for j, seg_size in enumerate(sizes[ci]):
+                    dst_ptr = slot["base"] + offset
+                    key_staging.append(dst_ptr)
+                    src_ptr = addrs[ci][j]
+                    src_mp = _mem_ptr(src_ptr, seg_size)
+                    dst_mp = _mem_ptr(dst_ptr, seg_size)
+                    with slot["stream"]:
+                        dst_mp.copy_from_device_async(src_mp, seg_size)
+                    offset += seg_size
+                staging_addrs.append(key_staging)
+                staging_sizes.append(sizes[ci])
+                chunk_keys.append(keys[ci])
+
+            slot["event"].record(slot["stream"])
+            slot["event"].synchronize()
+
+            results = pool._store.batch_put_from_multi_buffers(
+                chunk_keys,
+                staging_addrs,
+                staging_sizes,
+                pool._replicate_config,
+            )
+            return chunk_idxs, list(results)
+        finally:
+            pool.release(slot_idx)
 
     def _handle_request(self, req_meta: ReqMeta):
         # The single `finally` is the only way out, so the scheduler releases
@@ -967,12 +1212,17 @@ class KVCacheStoreSendingThread(KVTransferThread):
             batch_bytes = _sum_batch_bytes(sizes)
             put_start = time.perf_counter()
             try:
-                res = self.store.batch_put_from_multi_buffers(
-                    keys,
-                    addrs,
-                    sizes,
-                    self.replicate_config,
-                )
+                if self._host_staging and self._put_pool is not None:
+                    res = self._staged_put_from_multi_buffers(
+                        keys, addrs, sizes
+                    )
+                else:
+                    res = self.store.batch_put_from_multi_buffers(
+                        keys,
+                        addrs,
+                        sizes,
+                        self.replicate_config,
+                    )
                 failed = [i for i, v in enumerate(res) if v < 0]
                 self._record_operation(
                     "save_put",
@@ -1045,6 +1295,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         disk_offload_buffer_budget_bytes: int | None = None,
         record_operation: Callable[..., None] | None = None,
         request_queue: queue.Queue[Any] | None = None,
+        host_staging: bool = False,
+        staging_get_pool: _StagingSlotPool | None = None,
     ):
         super().__init__(
             store,
@@ -1056,6 +1308,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             record_operation=record_operation,
             request_queue=request_queue,
         )
+        self._host_staging = host_staging
         # _invalid_block_ids can be access by both the Worker and RecvingThread
         self._invalid_block_ids_lock = threading.Lock()
         self._invalid_block_ids: set[int] = set()
@@ -1068,6 +1321,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             )
         )
         self.coord = coord
+        self._get_pool = staging_get_pool
+        self._last_get_slots: set[int] = set()
 
     def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
         with self._invalid_block_ids_lock:
@@ -1079,9 +1334,128 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             self._invalid_block_ids.clear()
         return invalid_block_ids
 
+    def _staged_batch_get_into_multi_buffers(
+        self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]
+    ) -> list[int]:
+        """Load KV data through the ring-buffer staging slot pool.
+
+        Keys are packed into chunks that fit one slot each.  Each chunk
+        claims a slot, does one batched store GET (RDMA fills the slot),
+        then enqueues H2D copies on the slot's stream.  The slot event
+        is recorded so the caller can sync at request end.  Overlap:
+        while one chunk's RDMA+copy runs, another chunk's GET can
+        proceed on a different slot.
+        """
+        pool = self._get_pool
+        assert pool is not None
+        slot_size = pool.slot_size
+
+        chunks, oversized = _pack_staging_chunks(keys, addrs, sizes, slot_size)
+
+        result_map: dict[int, list[int]] = {}
+        for idx in oversized:
+            logger.error(
+                "Key %s too large (%d bytes) for staging slot (%d bytes)",
+                keys[idx], sum(sizes[idx]), slot_size,
+            )
+            result_map[idx] = [-1]
+
+        futures: list[Future[tuple[list[int], list[int], int]]] = []
+        for chunk in chunks:
+            future = pool.submit(
+                self._get_chunk, keys, addrs, sizes, chunk,
+            )
+            futures.append(future)
+
+        slots_used: set[int] = set()
+        try:
+            for future in futures:
+                chunk_idxs, chunk_results, slot_idx = future.result()
+                if slot_idx >= 0:
+                    slots_used.add(slot_idx)
+                for ci, cr in zip(chunk_idxs, chunk_results, strict=True):
+                    result_map[ci] = [cr]
+        except Exception:
+            for future in futures:
+                try:
+                    future.result()
+                except Exception:
+                    pass
+            raise
+
+        self._last_get_slots = slots_used
+        return [result_map[i][0] for i in range(len(keys))]
+
+    def _get_chunk(
+        self,
+        keys: list[str],
+        addrs: list[list[int]],
+        sizes: list[list[int]],
+        chunk_idxs: list[int],
+    ) -> tuple[list[int], list[int], int]:
+        pool = self._get_pool
+        assert pool is not None
+        try:
+            slot_idx = pool.claim()
+        except queue.Empty:
+            return chunk_idxs, [-1] * len(chunk_idxs), -1
+        slot = pool.slots[slot_idx]
+
+        try:
+            # Wait for any previous H2D from this slot to finish before the
+            # RDMA write overwrites the slot buffer.
+            slot["event"].synchronize()
+
+            staging_addrs: list[list[int]] = []
+            staging_sizes: list[list[int]] = []
+            chunk_keys: list[str] = []
+            offset = 0
+            for ci in chunk_idxs:
+                key_staging: list[int] = []
+                for seg_size in sizes[ci]:
+                    key_staging.append(slot["base"] + offset)
+                    offset += seg_size
+                staging_addrs.append(key_staging)
+                staging_sizes.append(sizes[ci])
+                chunk_keys.append(keys[ci])
+
+            results = pool._store.batch_get_into_multi_buffers(
+                chunk_keys, staging_addrs, staging_sizes
+            )
+
+            # Enqueue H2D copies for successful gets only.
+            for ci_idx, ci in enumerate(chunk_idxs):
+                if results[ci_idx] < 0:
+                    continue
+                for j, seg_size in enumerate(sizes[ci]):
+                    dst_ptr = addrs[ci][j]
+                    src_ptr = staging_addrs[ci_idx][j]
+                    dst_mp = _mem_ptr(dst_ptr, seg_size)
+                    src_mp = _mem_ptr(src_ptr, seg_size)
+                    with slot["stream"]:
+                        dst_mp.copy_from_device_async(src_mp, seg_size)
+
+            slot["event"].record(slot["stream"])
+            return chunk_idxs, list(results), slot_idx
+        finally:
+            pool.release(slot_idx)
+
+    def _sync_slots(self, slot_indices: set[int]) -> None:
+        """Wait for this request's slots' H2D copies to finish.
+
+        Only syncs slots the caller actually used — avoids blocking on
+        copies enqueued by other recv threads sharing the pool.
+        """
+        pool = self._get_pool
+        if pool is None:
+            return
+        for idx in slot_indices:
+            pool.slots[idx]["event"].synchronize()
+
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
+        self._last_get_slots = set()
         mask_num = (
             req_meta.load_spec.vllm_cached_tokens  # type: ignore[union-attr]
             // self.block_size
@@ -1180,9 +1554,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     tiers_by_key = _get_replica_tiers_by_key(self.store, batch_keys)
                 # Reset so the recorded RPC duration excludes tier lookup.
                 load_get_start = time.perf_counter()
-                res = self.store.batch_get_into_multi_buffers(
-                    batch_keys, batch_addrs, batch_sizes
-                )
+                if self._host_staging and self._get_pool is not None:
+                    res = self._staged_batch_get_into_multi_buffers(
+                        batch_keys, batch_addrs, batch_sizes
+                    )
+                else:
+                    res = self.store.batch_get_into_multi_buffers(
+                        batch_keys, batch_addrs, batch_sizes
+                    )
                 if tiers_by_key is not None:
                     _log_mooncake_load_tier_summary(
                         req_id, batch_keys, res, tiers_by_key
@@ -1230,8 +1609,23 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 e,
             )
 
-        self.set_finished_request(req_id)
-        self.request_queue.task_done()
+        try:
+            if self._host_staging and self._get_pool is not None:
+                self._sync_slots(self._last_get_slots)
+        except Exception as e:
+            # H2D copies may be incomplete — treat as a load failure so the
+            # scheduler retries rather than consuming corrupt KV state.
+            logger.error(
+                "Failed to sync get staging slots for request %s: %s; "
+                "marking %d blocks as load errors",
+                req_id,
+                e,
+                len(block_id_list_c),
+            )
+            self._add_load_error_block_ids(block_id_list_c)
+        finally:
+            self.set_finished_request(req_id)
+            self.request_queue.task_done()
 
 
 # ============================================================
@@ -1390,6 +1784,30 @@ class MooncakeStoreWorker:
         # Pool of load-receive threads
         self.kv_recv_threads: list[KVCacheStoreRecvingThread] = []
         self.num_recv_threads = max(1, envs.VLLM_MOONCAKE_LOAD_RECV_THREADS)
+        self._vllm_config = vllm_config
+        _extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self.host_staging = bool(_extra.get("host_staging", False))
+
+        def _parse_int(key: str, default: int) -> int:
+            raw = _extra.get(key, default)
+            try:
+                return int(raw)
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"kv_connector_extra_config['{key}'] must be an integer, "
+                    f"got {raw!r}"
+                ) from e
+
+        self._staging_buffer_size_mb = _parse_int("staging_buffer_size_mb", 256)
+        self._staging_num_slots = _parse_int("staging_num_slots", 1)
+        _raw_slot = _extra.get("staging_slot_size_mb")
+        self._staging_slot_size_mb: int | None = (
+            _parse_int("staging_slot_size_mb", 0) if _raw_slot is not None
+            else None
+        )
+
+        self._staging_put_pool: _StagingSlotPool | None = None
+        self._staging_get_pool: _StagingSlotPool | None = None
         self.recv_request_queue: queue.Queue[ReqMeta] = queue.Queue()
         self.finished_store_req: set[str] = set()
         self._kv_connector_stats_lock = threading.Lock()
@@ -1422,7 +1840,36 @@ class MooncakeStoreWorker:
                 )
             ]
         self._kv_cache_groups: list[KVCacheGroupSpec] = groups
-        spec_cfg = getattr(vllm_config, "speculative_config", None)
+
+    def _alloc_staging_buffer(self) -> None:
+        num_slots = self._staging_num_slots
+        if self._staging_slot_size_mb is not None:
+            slot_size_mb = self._staging_slot_size_mb
+        else:
+            slot_size_mb = self._staging_buffer_size_mb
+        slot_size_bytes = slot_size_mb * 1024 * 1024
+
+        if self.kv_role in ("kv_producer", "kv_both"):
+            self._staging_put_pool = _StagingSlotPool(
+                num_slots,
+                slot_size_bytes,
+                self.store,
+                self.store_replicate_config,
+                "put",
+            )
+
+        # Get pool is needed on every host_staging role: kv_producer also
+        # runs recv threads for its own prefix-cache loads from the store,
+        # and direct GPU-VA batch_get fails on GB10 (ibv_reg_mr -> EFAULT).
+        self._staging_get_pool = _StagingSlotPool(
+            num_slots,
+            slot_size_bytes,
+            self.store,
+            None,
+            "get",
+        )
+
+        spec_cfg = getattr(self._vllm_config, "speculative_config", None)
         use_eagle = bool(
             spec_cfg.use_eagle()
             if spec_cfg is not None and callable(getattr(spec_cfg, "use_eagle", None))
@@ -1441,13 +1888,13 @@ class MooncakeStoreWorker:
         # (MLA / shared GQA KV heads) share a namespace, TP-sharded Mamba
         # state gets one namespace per rank.
         metadata = KeyMetadata(
-            model_name=model_config.model.rstrip("/").split("/")[-1],
+            model_name=self._vllm_config.model_config.model.rstrip("/").split("/")[-1],
             tp_rank=self.tp_rank,
             pcp_rank=self.pcp_rank,
             dcp_rank=self.dcp_rank,
             pp_rank=self.pp_rank,
             cache_prefix=str(
-                vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+                self._vllm_config.kv_transfer_config.kv_connector_extra_config.get(
                     "cache_prefix", ""
                 )
             ),
@@ -1612,6 +2059,9 @@ class MooncakeStoreWorker:
             self.num_blocks,
         )
 
+        if self.host_staging:
+            self._alloc_staging_buffer()
+
         for db in self.token_dbs:
             db.set_kv_caches_base_addr(addrs)
             db.set_block_len(block_lens)
@@ -1633,6 +2083,8 @@ class MooncakeStoreWorker:
                 enable_group_semantics=self.enable_group_semantics,
                 supports_group_ids=self._supports_group_ids,
                 record_operation=self._record_kv_connector_operation,
+                host_staging=self.host_staging,
+                staging_put_pool=self._staging_put_pool,
             )
             self.kv_send_thread.start()
 
@@ -1650,6 +2102,8 @@ class MooncakeStoreWorker:
                 disk_offload_buffer_budget_bytes=self.disk_offload_buffer_budget_bytes,
                 record_operation=self._record_kv_connector_operation,
                 request_queue=self.recv_request_queue,
+                host_staging=self.host_staging,
+                staging_get_pool=self._staging_get_pool,
             )
             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
             recv_thread.start()
@@ -1918,6 +2372,13 @@ class MooncakeStoreWorker:
         buffers, and the connection to the master server. Idempotent so it is
         safe to call from both the explicit shutdown path and ``__del__``.
         """
+        for pool in (getattr(self, "_staging_put_pool", None),
+                      getattr(self, "_staging_get_pool", None)):
+            if pool is not None:
+                try:
+                    pool.shutdown()
+                except Exception as e:
+                    logger.warning("Error shutting down staging pool: %s", e)
         store = getattr(self, "store", None)
         if store is None:
             return

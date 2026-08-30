@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Callable
 
 import deep_ep
@@ -7,8 +8,13 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import envs
+from vllm.distributed import get_ep_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.prepare_finalize.ep_stats import (
+    init_ep_all2all_stats,
+    record_ep_all2all_stats,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
@@ -118,6 +124,13 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # activation scales in a packed ue8m0 format during object construction
         # time. This setting is handled by post_init_setup.
         self.use_ue8m0_dispatch = False
+
+        # Register this backend with the shared EP all2all stats accumulator.
+        try:
+            all2all_manager = get_ep_group().device_communicator.all2all_manager
+        except Exception:
+            all2all_manager = None
+        init_ep_all2all_stats("deepep_ll", all2all_manager)
 
     def post_init_setup(self, fused_experts: mk.FusedMoEExperts):
         if not fused_experts.supports_packed_ue8m0_act_scales():
@@ -237,11 +250,11 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
     ) -> tuple[Callable, mk.ReceiverType]:
-        if defer_input_quant:
-            raise NotImplementedError(
-                f"{self.__class__.__name__} does not support defer_input_quant=True. "
-                "Please select an MoE kernel that accepts quantized inputs."
-            )
+        # When defer_input_quant=True, the expert kernel expects unquantized
+        # BF16 inputs and handles quantization internally. Dispatch raw BF16
+        # data (no FP8/NVFP4 quantization before all2all) and skip _do_quant
+        # in the receiver.
+        dispatch_fp8 = self.use_fp8_dispatch and not defer_input_quant
 
         hidden_size = a1.size(1)
         assert hidden_size in self.SUPPORTED_HIDDEN_SIZES, (
@@ -251,14 +264,16 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         a2a_idx = dbo_current_ubatch_id()
 
-        if self.use_fp8_dispatch:
+        if dispatch_fp8:
             assert hidden_size % 128 == 0, (
                 "DeepEP kernels quantize the inputs in blocks of shape 128"
             )
 
         use_nvfp4 = False
         nvfp4_dispatch = (
-            quant_config.quant_dtype == "nvfp4" and envs.VLLM_DEEPEPLL_NVFP4_DISPATCH
+            not defer_input_quant
+            and quant_config.quant_dtype == "nvfp4"
+            and envs.VLLM_DEEPEPLL_NVFP4_DISPATCH
         )
         if nvfp4_dispatch:
             use_nvfp4 = True
@@ -289,6 +304,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         # Dispatch
         dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)
+        _t0 = time.perf_counter()
         (
             expert_x,
             expert_num_tokens,
@@ -300,9 +316,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             dispatch_topk_ids,
             self.max_tokens_per_rank,
             num_experts,
-            use_fp8=self.use_fp8_dispatch,
-            round_scale=self.use_ue8m0_dispatch,
-            use_ue8m0=self.use_ue8m0_dispatch,
+            use_fp8=dispatch_fp8,
+            round_scale=self.use_ue8m0_dispatch if dispatch_fp8 else False,
+            use_ue8m0=self.use_ue8m0_dispatch if dispatch_fp8 else False,
             **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
             **(
                 dict(x_global_scale=qc_a1_gscale_or_scale)
@@ -312,6 +328,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             async_finish=False,
             return_recv_hook=True,
         )
+        record_ep_all2all_stats("dispatch_latency", time.perf_counter() - _t0)
+        record_ep_all2all_stats("dispatch_tokens", float(a1.size(0)))
+        record_ep_all2all_stats("active_ranks", float(num_experts))
         self.handles[a2a_idx] = handle
 
         return (
@@ -322,6 +341,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 quant_config.a1_scale,
                 a1.dtype,
                 quant_config,
+                defer_input_quant=defer_input_quant,
             ),
         )
 
@@ -332,8 +352,14 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         a1_scale: torch.Tensor | None,
         a1_dtype: torch.dtype,
         quant_config: FusedMoEQuantConfig,
+        defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
-        expert_x, expert_x_scale = self._do_quant(expert_x, a1_dtype, quant_config)
+        if defer_input_quant:
+            expert_x_scale = None
+        else:
+            expert_x, expert_x_scale = self._do_quant(
+                expert_x, a1_dtype, quant_config
+            )
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=expert_num_tokens, expert_num_tokens_cpu=None
@@ -352,11 +378,6 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
-        if defer_input_quant:
-            raise NotImplementedError(
-                f"{self.__class__.__name__} does not support defer_input_quant=True. "
-                "Please select an MoE kernel that accepts quantized inputs."
-            )
         hook, receiver = self.prepare_async(
             a1,
             topk_weights,
@@ -365,6 +386,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_map,
             apply_router_weight_on_input,
             quant_config,
+            defer_input_quant,
         )
         hook()
         return receiver()
@@ -396,6 +418,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         combine_topk_ids = self._map_global_to_physical_ids(topk_ids)
         # TODO (varun) : Enable zero copy mode
         dbo_maybe_run_recv_hook()
+        _t0 = time.perf_counter()
         _, _, recv_hook = self.buffer.low_latency_combine(
             fused_expert_output,
             combine_topk_ids,
@@ -405,6 +428,10 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             zero_copy=False,
             return_recv_hook=do_recv_hook,
             out=output,
+        )
+        record_ep_all2all_stats("combine_latency", time.perf_counter() - _t0)
+        record_ep_all2all_stats(
+            "combine_tokens", float(fused_expert_output.size(0))
         )
 
         return recv_hook, lambda: None

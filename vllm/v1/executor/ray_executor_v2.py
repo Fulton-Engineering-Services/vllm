@@ -562,8 +562,21 @@ class RayExecutorV2(MultiprocExecutor):
             try:
                 ray.kill(handle.actor)
                 logger.debug("Killed actor rank=%d", handle.rank)
-            except Exception:
-                logger.exception("Failed to kill actor rank=%d", handle.rank)
+            except Exception as e:
+                # ActorHandleNotFoundError occurs when the handle was created
+                # in a previous Ray job (e.g. Serve redeployment). The actor
+                # is already dead — this is the expected end state, not an
+                # error. Log at debug to avoid noise during rolling deploys.
+                if ray is not None and isinstance(
+                    e, ray.exceptions.ActorHandleNotFoundError
+                ):
+                    logger.debug(
+                        "Actor rank=%d already gone (stale handle from "
+                        "previous job), skipping kill.",
+                        handle.rank,
+                    )
+                else:
+                    logger.exception("Failed to kill actor rank=%d", handle.rank)
 
         if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
             rpc_broadcast_mq.shutdown()

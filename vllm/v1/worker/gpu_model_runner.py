@@ -4570,6 +4570,29 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+            # Compute logits inside the forward context so the LM-head
+            # GEMM is captured by the cudagraph instead of running
+            # eagerly after the forward replay (nsys 2026-08-21:
+            # ~5.7 ms eager LM-head GEMM + 0.7 ms idle per decode
+            # step).  Only the common decode path (non-PP-broadcast,
+            # last rank, non-pooling); broadcast_pp_output and
+            # prompt-logprobs paths remain eager.
+            _graph_captured_logits = None
+            if (
+                not self.broadcast_pp_output
+                and not self.is_pooling_model
+                and get_pp_group().is_last_rank
+                and cudagraph_mode != CUDAGraphMode.NONE
+            ):
+                _hs = (
+                    model_output[0]
+                    if self.use_aux_hidden_state_outputs
+                    else model_output
+                )
+                _graph_captured_logits = self.model.compute_logits(
+                    _hs, logits_indices
+                )
+
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -4597,7 +4620,10 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                if _graph_captured_logits is not None:
+                    logits = _graph_captured_logits
+                else:
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
