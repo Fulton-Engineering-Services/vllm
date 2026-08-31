@@ -209,6 +209,46 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
         return [256]
 
 
+class B12xNonCompressedIndexerBackend(DeepseekV32IndexerBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "B12X_NON_COMPRESSED_INDEXER"
+
+
+class KpoolTailBackend(DeepseekV32IndexerBackend):
+    """Storage-only backend for the GLM-5.3-Flash kpool tail cache."""
+
+    @staticmethod
+    def get_name() -> str:
+        return "KPOOL_TAIL"
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        return (num_blocks, num_kv_heads, block_size, head_size)
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        if include_num_layers_dimension:
+            return (0, 1, 2, 3, 4)
+        return (0, 1, 2, 3)
+
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:
+        return []
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        return [MultipleOf(1)]
+
+
 @dataclass
 class DeepseekV32IndexerPrefillChunkMetadata:
     block_table: torch.Tensor
