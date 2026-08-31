@@ -69,9 +69,11 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         skip_topk: bool = False,
         non_causal_multi_token_decode: bool = False,
         allow_short_prefill_indexer_scoring_skip: bool = False,
+        fuse_qkv_rmsnorm: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.fuse_qkv_rmsnorm = fuse_qkv_rmsnorm
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
