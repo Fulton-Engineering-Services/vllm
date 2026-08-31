@@ -551,3 +551,35 @@ class MHCFusedPostPreOp(CustomOp):
             hc_post_mult_value,
             sinkhorn_repeat,
         )
+
+
+# --8<-- [start:hc_expand]
+def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
+    """Expand a single hidden stream into ``n`` HC residual streams.
+
+    Args:
+        x: ``(..., hidden_size)``
+        n: number of residual streams (``mhc_num_residual_streams``)
+    Returns:
+        ``(..., n, hidden_size)``
+    """
+    return x.unsqueeze(-2).expand(*x.shape[:-1], n, x.shape[-1]).contiguous()
+
+
+# --8<-- [end:hc_expand]
+
+
+# --8<-- [start:hc_contract]
+def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
+    """Collapse ``n`` HC residual streams back to a single hidden stream.
+
+    Args:
+        x: ``(..., n, hidden_size)``
+        n: number of residual streams (unused, kept for API symmetry)
+    Returns:
+        ``(..., hidden_size)``
+    """
+    return x.sum(dim=-2)
+
+
+# --8<-- [end:hc_contract]
