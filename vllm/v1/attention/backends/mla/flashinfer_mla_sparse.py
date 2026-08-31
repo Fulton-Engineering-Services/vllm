@@ -53,7 +53,7 @@ class _FlashInferMLASparseBackendBase(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [576]
+        return [512, 576]
 
     @classmethod
     def is_mla(cls) -> bool:

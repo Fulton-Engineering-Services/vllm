@@ -254,6 +254,26 @@ def has_flashinfer_sparse_mla_sm120_config(num_q_heads: int, top_k: int) -> bool
 
 
 @functools.cache
+def has_flashinfer_sm90_nope_mla() -> bool:
+    """Return ``True`` if FlashInfer ships the SM90 NoPE MLA wrapper."""
+    if not has_flashinfer():
+        return False
+    try:
+        import inspect
+        from flashinfer.mla import BatchMLAPagedAttentionWrapper
+    except ImportError:
+        return False
+    try:
+        params = inspect.signature(BatchMLAPagedAttentionWrapper.run).parameters
+    except (TypeError, ValueError):
+        return False
+    return (
+        "ckv_scale_arr" in params
+        and params["ckv_scale_arr"].kind is inspect.Parameter.KEYWORD_ONLY
+    )
+
+
+@functools.cache
 def has_flashinfer_cutedsl() -> bool:
     """Return ``True`` if FlashInfer cutedsl module is available."""
     return (
