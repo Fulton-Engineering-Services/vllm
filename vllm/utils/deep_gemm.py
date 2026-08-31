@@ -29,6 +29,8 @@ _DEEPGEMM_BLACKWELL_EXCLUDED_MODEL_TYPES: set[str] = {
     "qwen3_5_moe_text",
 }
 
+PAGED_MQA_PAGE_SIZES: tuple[int, ...] = (32, 64)
+
 
 def should_auto_disable_deep_gemm(model_type: str | None) -> bool:
     """Check if DeepGemm should be auto-disabled for this model on Blackwell.
