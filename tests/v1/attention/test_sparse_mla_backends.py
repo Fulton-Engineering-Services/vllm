@@ -1512,3 +1512,347 @@ def test_flashmla_fp8_paths_accept_decode_subset(monkeypatch, use_mixed_batch: b
     assert kernel_q_shapes == [(1, num_decode_tokens, 2, 3)]
     assert output.shape == (num_decode_tokens, 2, 1)
     assert lse is None
+
+
+# ---------------------------------------------------------------------------
+# SM90 NoPE backend tests (GLM-5.3 Flash code path)
+# ---------------------------------------------------------------------------
+# GLM-5.3 Flash uses NoPE MLA: kv_lora_rank=512, qk_rope_head_dim=0,
+# head_size=512. The SM90 backend (FlashInferMLASparseSM90Backend) is the
+# preferred backend for SM12x (GB10) with this config. These tests guard
+# against the production OOM where SM120 was selected instead of SM90.
+
+NOPE_BATCH_SPECS = {
+    "small_decode": BatchSpec(seq_lens=[128, 256], query_lens=[1, 1]),
+    "medium_decode": BatchSpec(seq_lens=[512, 1024], query_lens=[1, 1]),
+    "mixed_small": BatchSpec(seq_lens=[128, 256], query_lens=[1, 64]),
+}
+
+
+@pytest.mark.parametrize("batch_name", list(NOPE_BATCH_SPECS.keys()))
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8", "fp8_e4m3"])
+@pytest.mark.parametrize("block_size", [64])
+def test_sm90_nope_backend_decode_correctness(
+    default_vllm_config,
+    dist_init,
+    batch_name,
+    kv_cache_dtype,
+    block_size,
+    workspace_init,
+):
+    """Test SM90 sparse MLA decode correctness with NoPE (GLM-5.3 Flash) config.
+
+    NoPE MLA has qk_rope_head_dim=0, head_size=512 (just kv_lora_rank).
+    This is the exact code path that failed in production when SM120 was
+    selected instead of SM90.
+    """
+    from vllm.utils.flashinfer import has_flashinfer_sm90_nope_mla
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90 import (
+        FlashInferMLASparseSM90Backend,
+    )
+
+    # Skip if FlashInfer lacks SM90 NoPE MLA support.
+    if not has_flashinfer_sm90_nope_mla():
+        pytest.skip(
+            "FlashInfer lacks SM90 NoPE MLA support (ckv_scale_arr missing "
+            "from BatchMLAPagedAttentionWrapper.run)"
+        )
+
+    # Skip on non-SM12x devices (SM90 backend requires SM12x for kernel).
+    device_capability = current_platform.get_device_capability()
+    if device_capability is None or not FlashInferMLASparseSM90Backend.supports_compute_capability(
+        device_capability
+    ):
+        pytest.skip(
+            f"SM90 NoPE MLA backend requires SM12x, got SM{device_capability}"
+        )
+
+    if kv_cache_dtype not in FlashInferMLASparseSM90Backend.supported_kv_cache_dtypes:
+        pytest.skip(
+            f"SM90 backend does not support kv_cache_dtype={kv_cache_dtype}"
+        )
+
+    supported_block_sizes = FlashInferMLASparseSM90Backend.get_supported_kernel_block_sizes()
+    if block_size not in supported_block_sizes:
+        pytest.skip(
+            f"SM90 backend does not support block_size={block_size}"
+        )
+
+    batch_spec = NOPE_BATCH_SPECS[batch_name]
+
+    device = torch.device(DEVICE_TYPE)
+    dtype = torch.bfloat16
+
+    # NoPE MLA config (GLM-5.3 Flash signature):
+    # qk_rope_head_dim=0, head_size=kv_lora_rank=512
+    total_num_heads = 128
+    num_heads = total_num_heads  # TP=1 for unit test
+    kv_lora_rank = 512
+    qk_nope_head_dim = 128
+    qk_rope_head_dim = 0  # NoPE: no rope dimension
+    v_head_dim = 128
+    head_size = kv_lora_rank + qk_rope_head_dim  # 512
+    topk_tokens = 2048  # GLM-5.3 Flash uses index_topk=2048
+
+    max_seqlen = max(batch_spec.seq_lens)
+    total_cache_tokens = sum(batch_spec.seq_lens)
+
+    vllm_config = create_vllm_config(
+        model_name="deepseek-ai/DeepSeek-V2-Lite-Chat",
+        tensor_parallel_size=1,
+        max_model_len=max(max_seqlen, topk_tokens + 1),
+        num_gpu_blocks=max(2048, cdiv(total_cache_tokens, block_size) + 1),
+        block_size=block_size,
+        hf_config_override={
+            "index_topk": topk_tokens,
+            "attn_module_list_cfg": [{"topk_tokens": topk_tokens}],
+        },
+    )
+    model_config = vllm_config.model_config
+    model_config.hf_text_config = SimpleNamespace(
+        q_lora_rank=None,
+        kv_lora_rank=kv_lora_rank,
+        qk_nope_head_dim=qk_nope_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        v_head_dim=v_head_dim,
+        model_type="glm5_next",
+    )
+    model_config.dtype = dtype
+    model_config.get_num_attention_heads = MethodType(
+        lambda self, parallel_config: num_heads, model_config
+    )
+    model_config.get_num_kv_heads = MethodType(
+        lambda self, parallel_config: 1, model_config
+    )
+    model_config.get_head_size = MethodType(lambda self: head_size, model_config)
+    model_config.get_sliding_window = MethodType(lambda self: None, model_config)
+
+    kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
+
+    torch.manual_seed(0)
+    scale = 1.0 / math.sqrt(head_size)
+
+    W_UK = torch.rand(
+        kv_lora_rank, num_heads, qk_nope_head_dim, dtype=dtype, device=device
+    )
+    W_UV = torch.rand(kv_lora_rank, num_heads, v_head_dim, dtype=dtype, device=device)
+
+    seq_lens = batch_spec.seq_lens
+    query_lens = batch_spec.query_lens
+    total_query_tokens = sum(query_lens)
+
+    # Build sparse indices for each query token.
+    sparse_indices = torch.empty(
+        total_query_tokens, topk_tokens, dtype=torch.int32, device=device
+    )
+    positions = []
+    for i in range(batch_spec.batch_size):
+        s_len = seq_lens[i]
+        q_len = query_lens[i]
+        ctx_len = s_len - q_len
+        for q_idx in range(q_len):
+            positions.append(ctx_len + q_idx)
+
+    for tok_idx in range(total_query_tokens):
+        max_valid_idx = positions[tok_idx]
+        num_valid = min(topk_tokens, max_valid_idx + 1)
+        if num_valid > 0:
+            valid_range = torch.arange(num_valid, device=device, dtype=torch.int32)
+            tok_indices = valid_range % (max_valid_idx + 1)
+            tok_indices = torch.cat([
+                tok_indices,
+                torch.full(
+                    (topk_tokens - num_valid,), -1, device=device, dtype=torch.int32
+                ),
+            ])
+        else:
+            tok_indices = torch.full(
+                (topk_tokens,), -1, device=device, dtype=torch.int32
+            )
+            tok_indices[0] = 0
+        sparse_indices[tok_idx] = tok_indices
+
+    all_q_vllm, all_kv_c_vllm, all_k_pe_vllm = [], [], []
+    kv_c_contexts, k_pe_contexts = [], []
+    reference_outputs = []
+    kv_cache_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    global_token_idx = 0
+
+    for i in range(batch_spec.batch_size):
+        s_len = seq_lens[i]
+        q_len = query_lens[i]
+        ctx_len = s_len - q_len
+
+        # For NoPE: q has no rope component, only nope.
+        q_c = torch.rand(
+            q_len, num_heads, qk_nope_head_dim + qk_rope_head_dim,
+            dtype=dtype, device=device,
+        )
+        kv_c_full = torch.rand(s_len, kv_lora_rank, dtype=dtype, device=device)
+        # k_pe is zero-width for NoPE (qk_rope_head_dim=0)
+        k_pe_full = torch.rand(s_len, 1, max(qk_rope_head_dim, 1), dtype=dtype, device=device)
+
+        q_nope = q_c[..., :qk_nope_head_dim]
+        q_pe = q_c[..., qk_nope_head_dim:]  # empty for NoPE
+        ql_nope = torch.einsum("qnh,lnh->qnl", q_nope, W_UK)
+        q_mqa = (ql_nope, q_pe)
+
+        k_mqa = kv_c_full  # NoPE: no rope to concatenate
+        v_mqa = kv_c_full
+
+        for q_idx in range(q_len):
+            tok_sparse_idx = sparse_indices[global_token_idx]
+            valid_mask = tok_sparse_idx >= 0
+            valid_indices = tok_sparse_idx[valid_mask].long()
+
+            q_tok = q_mqa[0][q_idx:q_idx+1]  # (1, N, L) - nope part
+            k_sparse = k_mqa[valid_indices]  # (num_valid, L)
+            v_sparse = v_mqa[valid_indices]
+
+            k_sparse = k_sparse.unsqueeze(1).expand(-1, num_heads, -1)
+            v_sparse = v_sparse.unsqueeze(1).expand(-1, num_heads, -1)
+
+            q_sdpa = q_tok.unsqueeze(0).transpose(1, 2)
+            k_sdpa = k_sparse.unsqueeze(0).transpose(1, 2)
+            v_sdpa = v_sparse.unsqueeze(0).transpose(1, 2)
+
+            sdpa_out = torch.nn.functional.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa, scale=scale
+            )
+            sdpa_out = sdpa_out.transpose(1, 2).squeeze(0)
+            sdpa_out = torch.einsum("qnl,lnv->qnv", sdpa_out, W_UV)
+            reference_outputs.append(sdpa_out.flatten(start_dim=-2))
+            global_token_idx += 1
+
+        all_q_vllm.append(q_c)
+        all_kv_c_vllm.append(kv_c_full[ctx_len:])
+        all_k_pe_vllm.append(k_pe_full[ctx_len:])
+        kv_c_contexts.append(kv_c_full[:ctx_len+1])
+        k_pe_contexts.append(k_pe_full[:ctx_len+1])
+
+    query_vllm = torch.cat(all_q_vllm, dim=0)
+    kv_c_vllm = torch.cat(all_kv_c_vllm, dim=0)
+    k_pe_vllm = torch.cat(all_k_pe_vllm, dim=0)
+    sdpa_reference = torch.cat(reference_outputs, dim=0)
+
+    vllm_config.cache_config.cache_dtype = kv_cache_dtype
+    vllm_config.model_config.hf_config.index_topk = topk_tokens
+
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec, vllm_config.cache_config.block_size, device,
+        arange_block_indices=True,
+    )
+
+    kv_cache = create_and_prepopulate_kv_cache(
+        kv_c_contexts=kv_c_contexts,
+        k_pe_contexts=k_pe_contexts,
+        block_size=vllm_config.cache_config.block_size,
+        head_size=head_size,
+        dtype=dtype,
+        device=device,
+        num_blocks=vllm_config.cache_config.num_gpu_blocks,
+        common_attn_metadata=common_attn_metadata,
+        randomize_blocks=False,
+        kv_cache_dtype=kv_cache_dtype,
+        scale=kv_cache_scale,
+    )
+
+    from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
+
+    prefill_backend = get_mla_prefill_backend(vllm_config)(
+        num_heads=num_heads,
+        scale=scale,
+        kv_lora_rank=kv_lora_rank,
+        qk_nope_head_dim=qk_nope_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        v_head_dim=v_head_dim,
+        vllm_config=vllm_config,
+    )
+    vllm_config.compilation_config.static_forward_context["placeholder"] = (
+        SimpleNamespace(prefill_backend=prefill_backend)
+    )
+
+    backend_cls = FlashInferMLASparseSM90Backend
+    builder_cls = backend_cls.get_builder_cls()
+    builder = builder_cls(kv_cache_spec, ["placeholder"], vllm_config, device)
+    metadata = builder.build(
+        common_prefix_len=0, common_attn_metadata=common_attn_metadata
+    )
+
+    mock_indexer = SimpleNamespace(topk_indices_buffer=sparse_indices)
+
+    kv_b_proj_weight = torch.cat([W_UK, W_UV], dim=-1).view(
+        kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim)
+    )
+
+    mock_kv_b_proj = ColumnParallelLinear(
+        input_size=kv_lora_rank,
+        output_size=num_heads * (qk_nope_head_dim + v_head_dim),
+        bias=False,
+    ).to(device=device, dtype=dtype)
+    mock_kv_b_proj.weight = torch.nn.Parameter(kv_b_proj_weight.T.contiguous())
+
+    impl_cls = backend_cls.get_impl_cls()
+    with set_current_vllm_config(vllm_config):
+        impl = impl_cls(
+            num_heads=num_heads,
+            head_size=head_size,
+            scale=scale,
+            num_kv_heads=1,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype=vllm_config.cache_config.cache_dtype,
+            logits_soft_cap=None,
+            attn_type="decoder",
+            kv_sharing_target_layer_name=None,
+            q_lora_rank=None,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            qk_head_dim=qk_nope_head_dim + qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            kv_b_proj=mock_kv_b_proj,
+            indexer=mock_indexer,
+        )
+        impl.process_weights_after_loading(dtype)
+
+        mock_layer = MockSparseMLAAttentionLayer(
+            impl=impl,
+            num_heads=num_heads,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            device=device,
+            W_UK=W_UK,
+            W_UV=W_UV,
+            q_scale=1.0,
+            k_scale=1.0,
+        )
+
+    out_buffer = torch.empty(
+        metadata.num_actual_tokens, num_heads * v_head_dim, dtype=dtype, device=device
+    )
+
+    with torch.inference_mode():
+        backend_output = mock_layer.forward_impl(
+            query_vllm,
+            kv_c_vllm,
+            k_pe_vllm,
+            kv_cache,
+            metadata,
+            out_buffer,
+        )
+
+    assert backend_output.shape == sdpa_reference.shape
+    assert backend_output.dtype == sdpa_reference.dtype
+    assert torch.isfinite(backend_output).all()
+
+    if kv_cache_dtype.startswith("fp8"):
+        torch.testing.assert_close(
+            backend_output, sdpa_reference, rtol=0.065, atol=0.05
+        )
+    else:
+        torch.testing.assert_close(
+            backend_output, sdpa_reference, rtol=0.01, atol=0.01
+        )

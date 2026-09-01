@@ -167,3 +167,64 @@ def test_register_custom_mamba_backend_with_class_path():
     backend_cls = MambaAttentionBackendEnum.CUSTOM.get_class()
     assert backend_cls.get_name() == "CUSTOM_MAMBA"
     assert backend_cls.get_impl_cls() == CustomMambaAttentionImpl
+
+
+# ---------------------------------------------------------------------------
+# FlashInfer SM90 NoPE MLA feature detection tests
+# ---------------------------------------------------------------------------
+# has_flashinfer_sm90_nope_mla() gates whether the SM90 sparse MLA backend
+# accepts fp8 KV cache. If the deployed FlashInfer build lacks the
+# ckv_scale_arr parameter in BatchMLAPagedAttentionWrapper.run, SM90 rejects
+# fp8 KV and SM120 (with incompatible KV layout) takes over, causing OOM
+# on GLM-5.3 Flash deployments.
+
+def test_has_flashinfer_sm90_nope_mla_returns_bool():
+    """has_flashinfer_sm90_nope_mla() must return a bool (not None/exception).
+
+    The function is @functools.cache'd, so it runs once per process. It
+    inspects FlashInfer's BatchMLAPagedAttentionWrapper.run signature for
+    the ckv_scale_arr keyword-only parameter.
+    """
+    from vllm.utils.flashinfer import has_flashinfer_sm90_nope_mla
+
+    result = has_flashinfer_sm90_nope_mla()
+    assert isinstance(result, bool), (
+        f"has_flashinfer_sm90_nope_mla() must return bool, got {type(result)}"
+    )
+
+
+def test_flashinfer_sm90_nope_mla_enum_exists():
+    """FLASHINFER_MLA_SPARSE_SM90 must be a registered backend enum."""
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    assert hasattr(AttentionBackendEnum, "FLASHINFER_MLA_SPARSE_SM90"), (
+        "FLASHINFER_MLA_SPARSE_SM90 must exist in AttentionBackendEnum"
+    )
+
+
+def test_flashinfer_sm120_enum_exists():
+    """FLASHINFER_MLA_SPARSE_SM120 must be a registered backend enum."""
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    assert hasattr(AttentionBackendEnum, "FLASHINFER_MLA_SPARSE_SM120"), (
+        "FLASHINFER_MLA_SPARSE_SM120 must exist in AttentionBackendEnum"
+    )
+
+
+def test_sm90_and_sm120_are_distinct_enums():
+    """SM90 and SM120 must be distinct enum values (not aliases).
+
+    If they share the same value, registering one overwrites the other,
+    and the priority list silently routes to the wrong backend.
+    """
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    sm90 = AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90
+    sm120 = AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120
+    assert sm90 is not sm120, (
+        "SM90 and SM120 must be distinct enum members, not aliases"
+    )
+    assert sm90.value != sm120.value, (
+        f"SM90 and SM120 must have distinct values, "
+        f"both are {sm90.value!r}"
+    )
