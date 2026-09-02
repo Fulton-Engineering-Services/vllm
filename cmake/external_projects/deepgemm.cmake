@@ -28,9 +28,9 @@ if(DEEPGEMM_SRC_DIR)
   message(STATUS "DeepGEMM using local DEEPGEMM_SRC_DIR: ${deepgemm_SOURCE_DIR}")
 else()
   # Keep in sync with tools/install_deepgemm.sh
-  set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/vllm-project/DeepGEMM.git")
-  # TODO: switch to nv_dev branch after it support situ
-  set(_DEEPGEMM_UPSTREAM_TAG "e21c821f39a2056d68067a466c64ddc942200106")
+  set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/Fulton-Engineering-Services/DeepGEMM.git")
+  # SM121/GB10 support: adds arch_major==12 dispatch to all SM100 kernel paths
+  set(_DEEPGEMM_UPSTREAM_TAG "dcb83ed9683aa1d94f720bc6d2bb39139e402d96")
 
   set(_deepgemm_fc_root "${FETCHCONTENT_BASE_DIR}")
   if(NOT _deepgemm_fc_root)

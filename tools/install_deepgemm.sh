@@ -6,9 +6,9 @@ set -e
 
 # Default values
 # Keep DEEPGEMM_GIT_REF in sync with cmake/external_projects/deepgemm.cmake
-DEEPGEMM_GIT_REPO="https://github.com/vllm-project/DeepGEMM.git"
-# NOTE: This is currently targeting nv-dev branch due to sm120 support
-DEEPGEMM_GIT_REF="e21c821f39a2056d68067a466c64ddc942200106"
+DEEPGEMM_GIT_REPO="https://github.com/Fulton-Engineering-Services/DeepGEMM.git"
+# SM121/GB10 support: adds arch_major==12 dispatch to all SM100 kernel paths
+DEEPGEMM_GIT_REF="dcb83ed9683aa1d94f720bc6d2bb39139e402d96"
 WHEEL_DIR=""
 
 # Parse command line arguments
