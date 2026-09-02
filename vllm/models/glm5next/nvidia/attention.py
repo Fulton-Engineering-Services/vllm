@@ -150,10 +150,9 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
             page_size = max_page_size
         else:
             page_size = min_page_size
-        return replace(
-            spec,
-            storage_block_size=page_size * self._index_kpool,
-        )
+        spec = replace(spec)
+        object.__setattr__(spec, "storage_block_size", page_size * self._index_kpool)
+        return spec
 
 
 class Glm5NextTailCache(DeepseekV32IndexerCache):
