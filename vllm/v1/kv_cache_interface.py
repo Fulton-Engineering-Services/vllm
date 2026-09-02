@@ -388,7 +388,7 @@ class MLAAttentionSpec(FullAttentionSpec):
     model_version: str | None = None
     # Marks draft groups that flatten a non-causal query block into decode rows.
     non_causal_multi_token_decode: bool = False
-    # MLA stores a single latent vector per state; there is no separate V.
+    tokens_per_state: int = 1
     head_size_v: int = 0
 
     def __post_init__(self):
@@ -408,15 +408,17 @@ class MLAAttentionSpec(FullAttentionSpec):
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
+        tokens_per_state_set = set(spec.tokens_per_state for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(block_stride_set) == 1
+            and len(tokens_per_state_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, model version, and KV block "
-            "stride indexing."
+            "quantization method, compress ratio, model version, tokens per "
+            "state, and KV block stride indexing."
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
@@ -431,6 +433,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            tokens_per_state=tokens_per_state_set.pop(),
             non_causal_multi_token_decode=any(
                 spec.non_causal_multi_token_decode for spec in specs
             ),
