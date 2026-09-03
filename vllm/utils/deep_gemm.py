@@ -509,6 +509,58 @@ def transform_sf_into_required_layout(*args, **kwargs):
     )
 
 
+def _dequant_fp4_qkv_for_sm121(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[tuple[torch.Tensor, None], tuple[torch.Tensor, torch.Tensor]]:
+    """Dequantize FP4 Q and KV to FP8 for SM121 SM90-kernel compatibility.
+
+    SM121 routes through SM90 (wgmma) kernels which only accept FP8 inputs.
+    Converts packed-FP4 (uint8) + UE8M0 (int32) scales to FP8 (float8_e4m3fn)
+    values + FP32 scales.
+    """
+    q_vals, q_scale = q
+    kv_vals, kv_scale = kv
+    if q_scale is None:
+        return q, kv
+
+    assert q_vals.dtype == torch.uint8
+    assert q_scale.dtype == torch.int32
+    assert kv_vals.dtype == torch.uint8
+    assert kv_scale.dtype == torch.int32
+
+    def _fp4_packed_to_fp8(
+        packed: torch.Tensor, ue8m0: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        packed_f32 = packed.to(torch.float32)
+        lo = (packed_f32 % 16).to(torch.float32)
+        hi = (packed_f32 // 16).to(torch.float32)
+        vals = torch.stack([lo, hi], dim=-1).flatten(-2)
+
+        scales_s32 = ue8m0.to(torch.int32)
+        shifts = torch.tensor([0, 8, 16, 24], dtype=torch.int32, device=scales_s32.device)
+        bytes_t = ((scales_s32.unsqueeze(-1) >> shifts) & 0xFF).to(torch.float32)
+        exp2 = torch.where(bytes_t > 0, torch.exp2(bytes_t - 127.0), torch.tensor(0.0, device=bytes_t.device))
+
+        D = vals.shape[-1]
+        block_scale = exp2.flatten(-2)
+        block_scale = block_scale.repeat_interleave(32, dim=-1)
+        pad = (D + 127) // 128 * 128 - D
+        if pad > 0:
+            block_scale = block_scale[..., :D]
+
+        fp32 = vals * block_scale
+        max_abs = fp32.abs().max()
+        scale = max_abs / 448.0 if max_abs > 0 else 1.0
+        fp8 = (fp32 / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        fp8_scale = torch.tensor([scale], dtype=torch.float32, device=fp32.device)
+        return fp8, fp8_scale
+
+    q_vals_fp8, q_scale_fp8 = _fp4_packed_to_fp8(q_vals, q_scale)
+    kv_vals_fp8, kv_scale_fp8 = _fp4_packed_to_fp8(kv_vals, kv_scale)
+    return (q_vals_fp8, None), (kv_vals_fp8, kv_scale_fp8)
+
+
 def fp8_fp4_mqa_logits(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -544,6 +596,10 @@ def fp8_fp4_mqa_logits(
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
         return _missing()
+
+    if q[1] is not None and current_platform.is_device_capability_family(120):
+        q, kv = _dequant_fp4_qkv_for_sm121(q, kv)
+
     return _fp8_fp4_mqa_logits_impl(
         q,
         kv,

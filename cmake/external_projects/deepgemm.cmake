@@ -30,7 +30,7 @@ else()
   # Keep in sync with tools/install_deepgemm.sh
   set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/Fulton-Engineering-Services/DeepGEMM.git")
   # SM121/GB10 support: adds arch_major==12 dispatch to all SM100 kernel paths
-  set(_DEEPGEMM_UPSTREAM_TAG "dcb83ed131047e8784c5ee6433fa82ff813ca3b2")
+  set(_DEEPGEMM_UPSTREAM_TAG "b6957dc7045763a94cd0d19e637d2f16230dec48")
 
   set(_deepgemm_fc_root "${FETCHCONTENT_BASE_DIR}")
   if(NOT _deepgemm_fc_root)
