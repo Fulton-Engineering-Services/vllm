@@ -668,11 +668,15 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def support_deep_gemm(cls) -> bool:
-        """Currently, only Hopper and Blackwell GPUs are supported."""
+        """Currently, only Hopper and Blackwell GPUs are supported.
+        SM120/SM121 (GB10) is excluded: the SM100 GEMM kernels use
+        tcgen05.fence which ptxas rejects for sm_121a. The sparse indexer
+        still uses DeepGEMM via direct has_deep_gemm() + MQA logits calls
+        (those kernels compile fine); this gate only affects code paths that
+        check is_deep_gemm_supported() with a tilelang fallback."""
         return (
             cls.is_device_capability(90)
             or cls.is_device_capability_family(100)
-            or cls.is_device_capability_family(120)
         )
 
     @classmethod
