@@ -151,10 +151,6 @@ def split_indexer_prefill_chunks(
 
 class DeepseekV32IndexerBackend(AttentionBackend):
     @classmethod
-    def indexes_kv_by_block_stride(cls) -> bool:
-        return True
-
-    @classmethod
     def supports_pcp(cls) -> bool:
         return True
 
