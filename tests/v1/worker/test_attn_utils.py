@@ -248,6 +248,90 @@ def test_reshape_padded_quantized_kv_cache_preserves_scale_stride():
     assert kv_cache[1, 1].storage_offset() == spec.page_size_bytes + 16 * 1 * 8
 
 
+class FakeIndexerBackend:
+    """DeepseekV32IndexerBackend-shaped: (num_blocks, block_size, head_size)."""
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        return (num_blocks, block_size, head_size)
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        assert not include_num_layers_dimension
+        return (0, 1, 2)
+
+
+def test_reshape_padded_indexer_kv_cache_with_virtual_block_splitting():
+    """GLM-5.3-Flash kpool indexer: a padded page whose KV block (256 tokens)
+    is virtually split into 64-token DeepGEMM pool pages.
+
+    The padded-page strided view must NOT step a full padded page per kernel
+    block: with spec block_size=256 and kernel_block_size=64 that over-reads
+    the raw tensor by 4x (the 2026-09-04 glm53-flash-tp4 boot crash:
+    torch.as_strided RuntimeError, sizes [7704, 64, 132] strides [1572864,
+    132, 1] against a 4x-smaller allocation). The kernel blocks' content is
+    contiguous at the start of each page's unpadded region, so they tile the
+    raw tensor content-contiguously and the padded tails go unaddressed.
+    """
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    num_pages = 3
+    spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=132,  # 128 fp8 K + 4 B fp32 scale per 128-token block
+        dtype=torch.uint8,
+        tokens_per_state=4,  # index_kpool
+        page_size_padded=131072,  # padded to the DSA/MLA main page by unify
+    )
+    assert spec.unpadded_page_size_bytes == 33792
+
+    raw_tensors = {
+        "layer": torch.arange(spec.page_size_bytes * num_pages, dtype=torch.int32).to(
+            torch.uint8
+        )
+    }
+    attn_groups = [
+        AttentionGroup(
+            backend=FakeIndexerBackend,
+            layer_names=["layer"],
+            kv_cache_spec=spec,
+            kv_cache_group_id=0,
+        )
+    ]
+
+    # kernel_block_size=64 (DeepGEMM pool page): 4 kernel blocks per KV block.
+    kv_cache = _reshape_kv_cache(
+        attn_groups,
+        raw_tensors,
+        "auto",
+        [64],
+        {},
+    )["layer"]
+
+    assert kv_cache.shape == (num_pages * 4, 64, 132)
+    # Content-contiguous stride: kernel blocks tile the unpadded regions.
+    assert kv_cache.stride(0) == 64 * 132
+    # Chunk k of page p lands at p*33792 + k*8448 (data-contiguous, not
+    # p*131072 + k*anything): the block table expands KV block ids to
+    # consecutive kernel block ids, so uniform content addressing is what
+    # the DeepGEMM kernel dereferences.
+    for p in range(num_pages):
+        for k in range(4):
+            assert kv_cache[p * 4 + k].storage_offset() == p * 33792 + k * 8448
+    # The whole view stays inside the padded allocation.
+    span = (num_pages * 4 - 1) * kv_cache.stride(0) + 64 * 132
+    assert span <= spec.page_size_bytes * num_pages
+
+
 class FakeKVFirstBackend:
     """ROCm-style backend that puts K and V ahead of the block dim."""
 

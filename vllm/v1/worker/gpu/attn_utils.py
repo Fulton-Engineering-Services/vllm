@@ -309,9 +309,39 @@ def _reshape_attention_kv_cache(
         dtype_size = get_dtype_size(kv_cache_spec.dtype)
         page_stride = kv_cache_spec.page_size_bytes // dtype_size
 
+        # num_blocks counts kernel blocks; kv_cache_spec.block_size counts
+        # the tokens per padded page. When the kernel virtually splits each
+        # KV block into smaller blocks (e.g. the kpool indexer with spec
+        # block_size=256 but 64-token DeepGEMM pool pages), the chunks'
+        # content is laid out contiguously at the start of the page's
+        # unpadded region, so kernel blocks tile the raw tensor
+        # content-contiguously and the padded tails are simply never
+        # addressed by the kernel block table. Stepping a full page_stride
+        # per kernel block in that case over-reads the raw tensor by
+        # num_kernel_blocks_per_page (torch.as_strided RuntimeError).
+        num_kernel_blocks_per_page = num_blocks // (
+            kv_raw_tensor.numel() // kv_cache_spec.page_size_bytes
+        )
+        if num_kernel_blocks_per_page <= 1:
+            block_stride = page_stride
+        else:
+            content_stride = kv_cache_spec.unpadded_page_size_bytes // (
+                num_kernel_blocks_per_page * dtype_size
+            )
+            assert (
+                kv_cache_spec.unpadded_page_size_bytes
+                % (num_kernel_blocks_per_page * dtype_size)
+                == 0
+            ), (
+                f"Unpadded page ({kv_cache_spec.unpadded_page_size_bytes} B) "
+                f"does not divide evenly across {num_kernel_blocks_per_page} "
+                f"kernel blocks (dtype size {dtype_size})"
+            )
+            block_stride = content_stride
+
         num_blocks_dim = inv_order[0]
         strides = list(torch.empty(permuted_kv_cache_shape, device="meta").stride())
-        strides[num_blocks_dim] = page_stride
+        strides[num_blocks_dim] = block_stride
 
         kv_cache = torch.as_strided(
             kv_raw_tensor.view(dtype),
