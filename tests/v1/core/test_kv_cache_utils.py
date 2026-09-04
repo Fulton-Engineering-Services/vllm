@@ -2948,6 +2948,141 @@ def test_unify_kv_cache_spec_page_size_mamba():
     assert kv_cache_utils.unify_kv_cache_spec_page_size(specs) == specs
 
 
+def test_unify_kv_cache_page_size_glm5_next_indexer_must_pad():
+    """GLM-5.3-Flash TP4 boot regression: the sparse-attention indexer k_cache
+    page never divides the DSA/MLA main page at any legal block size, so KV
+    page unification must pad the indexer page via the block-stride path.
+
+    Exact spec mix at --block-size 256 with fp8 KV (checkpoint config:
+    kv_lora_rank=512, qk_rope_head_dim=0, index_kpool=4):
+
+      * DSA/MLA main:  MLAAttentionSpec, 1 head x 512B fp8 latent  -> 131,072 B
+      * indexer k_cache: MLAAttentionSpec, 1 head x 132B uint8 (128 fp8 K +
+        4B fp32 scale per 128-token block) -> 33,792 B
+      * indexer tail:  KpoolTailSpec, 2 slots x 4 tokens x 128 bf16 -> 4,096 B
+
+    131,072 % 33,792 = 29,696 (and at block_size 512: 262,144 % 33,792 =
+    25,600) - non-integer at every block size because 33,792 = 2^8 x 132
+    carries an odd factor (33) that the 512-byte-head MLA page never shares.
+    The uniform-type tuple path is unreachable (KpoolTailSpec block_size=4
+    breaks block-size uniformity), so the only path is padding, which is
+    gated on indexes_kv_by_block_stride. Removing that flag from the MLA
+    backends (as in the reverted 5f5fb462e9) makes the model unbootable.
+    """
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+        _FlashInferMLASparseBackendBase,
+    )
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
+    from vllm.v1.kv_cache_interface import KpoolTailSpec
+
+    # The GB10 backends the specs are served by must keep opting into the
+    # padded-page strided view; this is the line the bad revert removed.
+    assert DeepseekV32IndexerBackend.indexes_kv_by_block_stride() is True
+    assert _FlashInferMLASparseBackendBase.indexes_kv_by_block_stride() is True
+
+    dsa_main = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,  # kv_lora_rank, qk_rope_head_dim=0 (mla_use_nope)
+        dtype=torch.uint8,  # --kv-cache-dtype fp8_e4m3
+        indexes_kv_by_block_stride=True,
+    )
+    indexer = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=132,  # 128 fp8 K + 4B scale per 128-token quant block
+        dtype=torch.uint8,
+        indexes_kv_by_block_stride=True,
+        tokens_per_state=4,  # index_kpool
+    )
+    tail = KpoolTailSpec(
+        block_size=4,  # index_kpool
+        num_kv_heads=2,  # raw bf16 K + gate score
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=4,
+        indexes_kv_by_block_stride=True,
+    )
+
+    # Document the byte math that forces padding (guards against a future
+    # "just pick block_size X" fix that cannot exist).
+    assert dsa_main.page_size_bytes == 131072
+    assert indexer.page_size_bytes == 33792
+    assert tail.page_size_bytes == 4096
+    assert 131072 % 33792 == 29696
+
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(
+        {
+            "language_model.model.layers.3.self_attn": dsa_main,
+            "language_model.model.layers.3.self_attn.indexer.k_cache": indexer,
+            "language_model.model.layers.3.self_attn.indexer.tail_cache": tail,
+        }
+    )
+
+    # Max-page layer is untouched.
+    unified_main = unified["language_model.model.layers.3.self_attn"]
+    assert unified_main == dsa_main
+    # Indexer pads to the MLA page; logical block_size is preserved so the
+    # DeepGEMM paged-MQA kernel still sees its 64-entry pool pages.
+    unified_indexer = unified["language_model.model.layers.3.self_attn.indexer.k_cache"]
+    assert unified_indexer.page_size_padded == 131072
+    assert unified_indexer.page_size_bytes == 131072
+    assert unified_indexer.real_page_size_bytes == 33792
+    assert unified_indexer.block_size == 256
+    # Tail divides the max evenly (131072 / 4096 = 32) -> block_size scales.
+    unified_tail = unified["language_model.model.layers.3.self_attn.indexer.tail_cache"]
+    assert unified_tail.block_size == 4 * 32
+    assert unified_tail.page_size_bytes == 131072
+    assert unified_tail.page_size_padded is None
+
+
+def test_unify_kv_cache_page_size_glm5_next_indexer_no_block_size_escapes():
+    """No --block-size choice makes the GLM-5.3-Flash indexer page divide the
+    MLA main page; without indexes_kv_by_block_stride the model cannot boot
+    at any block size. Guards against re-applying the revert under a new
+    block-size rationale (the claim that killed it last time)."""
+    for block_size in (128, 256, 512, 1024):
+        # Indexer spec recalcs its block_size in get_kv_cache_spec:
+        # storage_block = block_size // index_kpool(4), snapped down to the
+        # largest DeepGEMM page in {32, 64} that tiles it, then re-inflated.
+        storage = block_size // 4
+        if storage <= 64:
+            pool_page = storage
+        elif storage % 64 == 0:
+            pool_page = 64
+        else:
+            pool_page = 32
+        indexer_block = pool_page * 4
+        indexer_page = indexer_block * 132
+        mla_page = block_size * 512
+        assert mla_page % indexer_page != 0, (
+            f"block_size={block_size}: {mla_page} %% {indexer_page} == 0 - "
+            "page sizes became divisible, the padding path is no longer "
+            "mandatory and this test (and the block-stride override) "
+            "should be re-evaluated"
+        )
+
+        dsa_main = MLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+        )
+        indexer = MLAAttentionSpec(
+            block_size=indexer_block,
+            num_kv_heads=1,
+            head_size=132,
+            dtype=torch.uint8,
+            tokens_per_state=4,
+            # The failure mode of the revert: no block-stride opt-in.
+            indexes_kv_by_block_stride=False,
+        )
+        with pytest.raises(NotImplementedError, match="indexes_kv_by_block_stride"):
+            kv_cache_utils.unify_kv_cache_spec_page_size(
+                {"attn": dsa_main, "attn.indexer.k_cache": indexer}
+            )
+
+
 def test_hma_not_disabled_when_kv_events_enabled():
     """
     Test enabling KV events must not force disable_hybrid_kv_cache_manager to True.
