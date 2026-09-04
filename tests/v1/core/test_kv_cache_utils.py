@@ -3083,6 +3083,58 @@ def test_unify_kv_cache_page_size_glm5_next_indexer_no_block_size_escapes():
             )
 
 
+def test_glm5_next_kpool_tail_builder_never_schedules_deepgemm():
+    """The storage-only kpool tail cache must not schedule DeepGEMM
+    paged-MQA work: its spec ratio-scales to the model's unified block size
+    (e.g. 3072 tokens), which is not a valid DeepGEMM block_kv and trips the
+    kernel's ``block_kv == 64`` assert (csrc/apis/attention.hpp:220) during
+    the FlashInfer sparse-MLA warmup dummy run.
+
+    Regression for the 2026-09-04 glm53-flash-tp4 boot failure, the third
+    distinct KV-cache-layer crash: the KpoolTailBackend inherited
+    DeepseekV32IndexerMetadataBuilder, whose build() passes
+    kv_cache_spec.storage_block_size (3072 after ratio-scaling the 2,048 B
+    tail page 768x to the 1,572,864 B unified max page) to
+    get_paged_mqa_logits_metadata. The tail metadata is consumed only for
+    its token-granular slot_mapping, so the tail builder skips the DeepGEMM
+    scheduler while keeping the DeepseekV32IndexerMetadata shape the kpool
+    op asserts on.
+    """
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepseekV32IndexerMetadataBuilder,
+        KpoolTailBackend,
+        KpoolTailMetadataBuilder,
+    )
+
+    builder_cls = KpoolTailBackend.get_builder_cls()
+    assert builder_cls is KpoolTailMetadataBuilder
+    assert issubclass(builder_cls, DeepseekV32IndexerMetadataBuilder)
+    assert builder_cls.schedules_deepgemm_paged_mqa is False
+    assert DeepseekV32IndexerMetadataBuilder.schedules_deepgemm_paged_mqa is True
+
+    # The tail spec's page (2,048 B: 2 head slots x 4 tokens x 128 bf16 with
+    # head_size_v=0) always divides the unified max page, so the tail takes
+    # the ratio-scaling path in page unification, landing on block sizes
+    # that are never valid DeepGEMM pool pages (32/64). Show it with the
+    # GLM-5.3-Flash TP4 numbers: 768x to block 3072 against the 1,572,864 B
+    # unified page produced by the padded indexer group.
+    from vllm.v1.kv_cache_interface import KpoolTailSpec
+
+    tail = KpoolTailSpec(
+        block_size=4,
+        num_kv_heads=2,
+        head_size=128,
+        head_size_v=0,  # raw bf16 K + gate score pack into 2 head slots
+        dtype=torch.bfloat16,
+        sliding_window=4,
+    )
+    assert tail.page_size_bytes == 2048
+    assert 1572864 % tail.page_size_bytes == 0
+    scaled_block = tail.block_size * (1572864 // tail.page_size_bytes)
+    assert scaled_block == 3072
+    assert scaled_block not in (32, 64)
+
+
 def test_hma_not_disabled_when_kv_events_enabled():
     """
     Test enabling KV events must not force disable_hybrid_kv_cache_manager to True.

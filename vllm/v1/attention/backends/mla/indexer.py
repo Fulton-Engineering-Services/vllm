@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
 
@@ -225,6 +226,10 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
     @staticmethod
     def get_name() -> str:
         return "KPOOL_TAIL"
+
+    @staticmethod
+    def get_builder_cls() -> type["KpoolTailMetadataBuilder"]:
+        return KpoolTailMetadataBuilder
 
     @staticmethod
     def get_kv_cache_shape(
@@ -556,6 +561,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     # so this is None; its own split uses self.decode_threshold.
     reorder_batch_threshold: int | None = None
     requires_block_table_width = True
+    # Whether build() schedules DeepGEMM paged-MQA logits work. Storage-only
+    # subclasses (KpoolTailMetadataBuilder) produce metadata purely for their
+    # token-granular slot_mapping and never launch the DeepGEMM kernel; their
+    # spec's storage block (the ratio-scaled model block size, e.g. 3072) is
+    # not a valid DeepGEMM block_kv and would trip the kernel's
+    # block_kv == 64 assert.
+    schedules_deepgemm_paged_mqa: ClassVar[bool] = True
 
     @classmethod
     def get_cudagraph_support(
@@ -1080,7 +1092,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            if (
+                current_platform.is_cuda()
+                and has_deep_gemm()
+                and self.schedules_deepgemm_paged_mqa
+            ):
                 block_kv = self.kv_cache_spec.storage_block_size
                 # DeepGEMM asserts block_kv == 64 (or 32) in
                 # csrc/apis/attention.hpp. Log the full spec state so a
@@ -1131,6 +1147,21 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
 
         return attn_metadata
+
+
+class KpoolTailMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
+    """Builder for the storage-only kpool tail cache.
+
+    Produces the same DeepseekV32IndexerMetadata shape as the indexer
+    builder (the kpool op asserts on it and reads only ``slot_mapping`` /
+    ``num_decode_tokens``) but never schedules DeepGEMM paged-MQA work:
+    the tail spec's storage block is the ratio-scaled model block size
+    (e.g. 3072 tokens after page unification against the padded indexer
+    page), which is not a valid DeepGEMM block_kv and trips the kernel's
+    ``block_kv == 64`` assert (csrc/apis/attention.hpp:220).
+    """
+
+    schedules_deepgemm_paged_mqa: ClassVar[bool] = False
 
 
 def build_prefill_chunk_metadata(
