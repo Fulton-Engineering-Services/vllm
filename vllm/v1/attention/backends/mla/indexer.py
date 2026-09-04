@@ -485,6 +485,11 @@ _BUILD_PREFILL_CHUNK_METADATA_KERNEL = BuildPrefillChunkMetadataKernel()
 @dataclass
 class DeepseekV32IndexerPrefillMetadata:
     chunks: list[DeepseekV32IndexerPrefillChunkMetadata]
+    # Max prefill context length in tokens (exact over prefill rows), or -1
+    # when unknown. The kpool indexer op reads this for its host-side
+    # short-prefill predicate (skip sparse scoring when every prefill row is
+    # <= topk_tokens); -1 falls back to a device-side positions.max() check.
+    max_prefill_seq_len: int = -1
 
 
 @dataclass
@@ -987,7 +992,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 # Skip when total_seq_lens is 0 (i.e., no compressed token).
                 if metadata is not None:
                     chunks.append(metadata)
-            prefill_metadata = DeepseekV32IndexerPrefillMetadata(chunks)
+            prefill_metadata = DeepseekV32IndexerPrefillMetadata(
+                chunks,
+                max_prefill_seq_len=(
+                    # Exact over prefill rows; token-granular (uncompressed),
+                    # matching the op's comparison against topk_tokens.
+                    int(common_attn_metadata.seq_lens_cpu[num_decodes:].max().item())
+                    if num_prefills > 0
+                    else 0
+                ),
+            )
 
         decode_metadata = None
         if num_decodes > 0:

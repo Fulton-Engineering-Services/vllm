@@ -3083,6 +3083,32 @@ def test_unify_kv_cache_page_size_glm5_next_indexer_no_block_size_escapes():
             )
 
 
+def test_glm5_next_indexer_prefill_metadata_has_max_prefill_seq_len():
+    """The kpool indexer op reads prefill_metadata.max_prefill_seq_len for
+    its host-side short-prefill predicate (skip sparse scoring when every
+    prefill row fits in topk_tokens). The field existed in the GLM-5.3-Flash
+    support branch's indexer but was dropped when the cu133 fork rebased
+    onto a newer upstream indexer, crashing the warmup dummy run with
+    ``AttributeError: 'DeepseekV32IndexerPrefillMetadata' object has no
+    attribute 'max_prefill_seq_len'``. Pin the dataclass contract.
+    """
+    import dataclasses
+
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepseekV32IndexerPrefillMetadata,
+    )
+
+    fields = {f.name: f for f in dataclasses.fields(DeepseekV32IndexerPrefillMetadata)}
+    assert "max_prefill_seq_len" in fields
+    # -1 (unknown) must be the default: the op treats it as "fall back to the
+    # device-side positions.max() check".
+    assert fields["max_prefill_seq_len"].default == -1
+    # And the field must accept a positional construction from the builder
+    # (chunks only) without it.
+    meta = DeepseekV32IndexerPrefillMetadata(chunks=[])
+    assert meta.max_prefill_seq_len == -1
+
+
 def test_glm5_next_kpool_tail_builder_never_schedules_deepgemm():
     """The storage-only kpool tail cache must not schedule DeepGEMM
     paged-MQA work: its spec ratio-scales to the model's unified block size
