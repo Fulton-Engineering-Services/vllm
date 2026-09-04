@@ -662,6 +662,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # Get compress_ratio for DeepseekV4 support
         if isinstance(self.kv_cache_spec, MLAAttentionSpec):
             self.compress_ratio = self.kv_cache_spec.compress_ratio
+        logger.info_once(
+            "DSA indexer metadata builder spec: block_size=%d "
+            "storage_block_size=%d compress_ratio=%d tokens_per_state=%s "
+            "page_size_padded=%s",
+            self.kv_cache_spec.block_size,
+            self.kv_cache_spec.storage_block_size,
+            self.compress_ratio,
+            getattr(self.kv_cache_spec, "tokens_per_state", None),
+            getattr(self.kv_cache_spec, "page_size_padded", None),
+        )
         if self.dcp_world_size > 1 and self.compress_ratio > 1:
             raise NotImplementedError(
                 "DCP is not supported with sparse indexer KV compression "
@@ -1071,9 +1081,27 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
             if current_platform.is_cuda() and has_deep_gemm():
+                block_kv = self.kv_cache_spec.storage_block_size
+                # DeepGEMM asserts block_kv == 64 (or 32) in
+                # csrc/apis/attention.hpp. Log the full spec state so a
+                # mismatch is diagnosable from the journal without a rebuild
+                # (see the 2026-09-04 glm53-flash-tp4 boot failures).
+                if block_kv not in (32, 64):
+                    logger.error(
+                        "DeepGEMM paged-MQA block_kv=%d will be rejected by "
+                        "the kernel (needs 32 or 64). kv_cache_spec: "
+                        "block_size=%d compress_ratio=%s tokens_per_state=%s "
+                        "storage_block_size=%d page_size_padded=%s",
+                        block_kv,
+                        self.kv_cache_spec.block_size,
+                        getattr(self.kv_cache_spec, "compress_ratio", None),
+                        getattr(self.kv_cache_spec, "tokens_per_state", None),
+                        self.kv_cache_spec.storage_block_size,
+                        getattr(self.kv_cache_spec, "page_size_padded", None),
+                    )
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
-                    self.kv_cache_spec.storage_block_size,
+                    block_kv,
                     self.num_sms,
                     indices=decode_indices,
                 )
