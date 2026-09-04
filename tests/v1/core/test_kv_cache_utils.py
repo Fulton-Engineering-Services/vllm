@@ -3083,46 +3083,6 @@ def test_unify_kv_cache_page_size_glm5_next_indexer_no_block_size_escapes():
             )
 
 
-def test_glm5_next_indexer_block_kv_is_pool_page():
-    """The DeepGEMM paged-MQA scheduler must receive the pool-page block_kv
-    (storage_block_size // tokens_per_state), not the kpool storage block.
-
-    Regression for the 2026-09-04 glm53-flash-tp4 boot crash:
-    `RuntimeError: Assertion error (csrc/apis/attention.hpp:220):
-    block_kv == 64` from get_paged_mqa_logits_metadata during the
-    FlashInfer sparse-MLA warmup dummy run. The builder passed
-    kv_cache_spec.storage_block_size (256 = 64-token pool page x
-    index_kpool 4) directly; DeepGEMM requires the 64-token pool page,
-    matching the kv_cache tensor's block dim and the block table's
-    kernel-block granularity. DeepSeek indexers (tokens_per_state=1)
-    are unaffected: block_kv == storage_block_size as before.
-    """
-    indexer = MLAAttentionSpec(
-        block_size=256,
-        num_kv_heads=1,
-        head_size=132,
-        dtype=torch.uint8,
-        tokens_per_state=4,
-    )
-    # Mirror the builder's computation in
-    # DeepseekV32IndexerMetadataBuilder.build().
-    tokens_per_state = getattr(indexer, "tokens_per_state", 1)
-    block_kv = indexer.storage_block_size // tokens_per_state
-    assert indexer.storage_block_size == 256
-    assert block_kv == 64
-
-    deepseek_indexer = MLAAttentionSpec(
-        block_size=64,
-        num_kv_heads=1,
-        head_size=132,
-        dtype=torch.uint8,
-    )
-    block_kv_ds = deepseek_indexer.storage_block_size // getattr(
-        deepseek_indexer, "tokens_per_state", 1
-    )
-    assert block_kv_ds == 64
-
-
 def test_hma_not_disabled_when_kv_events_enabled():
     """
     Test enabling KV events must not force disable_hybrid_kv_cache_manager to True.

@@ -1068,20 +1068,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
 
-            # DeepGEMM is required for the paged MQA logits on CUDA devices.
-            # block_kv must be the kernel's pool-page size: for a kpool
-            # indexer (tokens_per_state > 1, GLM-5.3-Flash) the storage block
-            # (block_size // compress_ratio) spans index_kpool pool pages, and
-            # the DeepGEMM kernel asserts block_kv == 64 (or 32) — the pool
-            # page, matching the kv_cache tensor's block dim and the block
-            # table's kernel-block granularity.
-            tokens_per_state = getattr(self.kv_cache_spec, "tokens_per_state", 1)
-            block_kv = self.kv_cache_spec.storage_block_size // tokens_per_state
+            # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
             if current_platform.is_cuda() and has_deep_gemm():
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
-                    block_kv,
+                    self.kv_cache_spec.storage_block_size,
                     self.num_sms,
                     indices=decode_indices,
                 )
