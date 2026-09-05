@@ -29,6 +29,7 @@ import torch
 from vllm.config import (
     CacheConfig,
     CompilationConfig,
+    DeviceConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -99,6 +100,7 @@ def _vllm_config() -> VllmConfig:
         scheduler_config=scheduler_config,
         parallel_config=parallel_config,
         compilation_config=CompilationConfig(mode=0),
+        device_config=DeviceConfig(device="cuda"),
         speculative_config=None,
         kv_transfer_config=None,
     )
