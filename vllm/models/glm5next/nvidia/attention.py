@@ -33,7 +33,7 @@ from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
-from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
+from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES  # noqa: F401  (runtime kernel tiling; not used in spec sizing)
 from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
@@ -124,10 +124,17 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         from dataclasses import replace
 
         spec = super().get_kv_cache_spec(vllm_config)
-        # ``tokens_per_state`` is the KV-spec representation of kpool
-        # compression in the current cache-layout API.
+        # ``compress_ratio = index_kpool`` makes vLLM's indexer metadata builder
+        # emit pool-granular slot_mapping / page_table and shrinks the cache
+        # allocation to ``storage_block_size = block_size // kpool`` -- the
+        # day-0 semantics. Do NOT shrink ``block_size`` to the DeepGEMM page
+        # tile here: that is a *virtual* split of the storage block, and
+        # shrinking the spec's block_size makes the hybrid-KV page unification
+        # pad this layer's small page up to the MLA page while billing at the
+        # tiny block_size, inflating the per-token KV cost ~9x (the glm53-flash
+        # 22.8 GiB @ 115K-token sizing failure).
         assert isinstance(spec, MLAAttentionSpec)
-        spec = replace(spec, tokens_per_state=self._index_kpool)
+        spec = replace(spec, compress_ratio=self._index_kpool)
 
         # DeepGEMM paged-MQA takes block_kv in {32, 64}; the storage block
         # (= block_size // index_kpool) is virtually split into pool pages of
@@ -141,18 +148,6 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
             "that DeepGEMM paged-MQA pool pages (32 or 64 entries) tile the "
             f"storage block, got block_size={spec.block_size} -> "
             f"storage_block_size={storage_block_size}."
-        )
-        max_page_size = max(PAGED_MQA_PAGE_SIZES)
-        min_page_size = min(PAGED_MQA_PAGE_SIZES)
-        if storage_block_size <= max_page_size:
-            page_size = storage_block_size
-        elif storage_block_size % max_page_size == 0:
-            page_size = max_page_size
-        else:
-            page_size = min_page_size
-        spec = replace(
-            spec,
-            block_size=page_size * self._index_kpool * spec.compress_ratio,
         )
         return spec
 

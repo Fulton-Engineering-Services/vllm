@@ -214,6 +214,9 @@ def test_indexer_spec_block_size_preserved(cfg_and_specs):
         "shrinking it to the DeepGEMM page tile inflates per-token billing 9x"
     )
     assert idx_spec.storage_block_size == BLOCK_SIZE // INDEX_KPOOL
+    # The kpool compression must be expressed as compress_ratio (day-0
+    # semantics), which is what actually shrinks storage_block_size.
+    assert idx_spec.compress_ratio == INDEX_KPOOL
 
 
 def test_needed_memory_fits_reference_budget(cfg_and_specs):
