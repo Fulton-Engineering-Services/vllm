@@ -67,28 +67,33 @@ EXPECTED_AVAILABLE_GIB = 22.62
 
 
 def _vllm_config() -> VllmConfig:
-    # ModelConfig validates the model path at construction; the sizing code only
-    # reads max_model_len/original_max_model_len, so stub it without touching the
-    # network or the model dir.
+    # The pydantic configs validate / inherit cross-references at construction
+    # (ModelConfig hits the network for the model id, SchedulerConfig inherits
+    # max_model_len). The sizing code only reads a handful of fields, so stub
+    # each sub-config and set exactly those.
     model_config = ModelConfig.__new__(ModelConfig)
     object.__setattr__(model_config, "max_model_len", MAX_MODEL_LEN)
     object.__setattr__(model_config, "original_max_model_len", MAX_MODEL_LEN)
+    cache_config = CacheConfig.__new__(CacheConfig)
+    object.__setattr__(cache_config, "block_size", BLOCK_SIZE)
+    object.__setattr__(cache_config, "gpu_memory_utilization", 0.75)
+    object.__setattr__(cache_config, "cache_dtype", "fp8_e4m3")
+    object.__setattr__(cache_config, "mamba_cache_mode", "align")
+    object.__setattr__(cache_config, "num_gpu_blocks_override", None)
+    scheduler_config = SchedulerConfig.__new__(SchedulerConfig)
+    object.__setattr__(scheduler_config, "disable_hybrid_kv_cache_manager", False)
+    parallel_config = ParallelConfig.__new__(ParallelConfig)
+    object.__setattr__(parallel_config, "decode_context_parallel_size", 1)
+    compilation_config = CompilationConfig.__new__(CompilationConfig)
+    object.__setattr__(compilation_config, "static_forward_context", {})
     return VllmConfig(
         model_config=model_config,
-        cache_config=CacheConfig(
-            block_size=BLOCK_SIZE,
-            gpu_memory_utilization=0.75,
-            cache_dtype="fp8_e4m3",
-        ),
-        scheduler_config=SchedulerConfig(
-            max_num_batched_tokens=16384,
-            max_num_seqs=6,
-        ),
-        parallel_config=ParallelConfig(
-            tensor_parallel_size=4,
-            pipeline_parallel_size=1,
-        ),
-        compilation_config=CompilationConfig(mode=0),
+        cache_config=cache_config,
+        scheduler_config=scheduler_config,
+        parallel_config=parallel_config,
+        compilation_config=compilation_config,
+        speculative_config=None,
+        kv_transfer_config=None,
     )
 
 
