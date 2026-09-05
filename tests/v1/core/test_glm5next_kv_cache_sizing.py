@@ -133,8 +133,10 @@ def _build_specs(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 cache_dtype_str="fp8_e4m3",
                 head_size_v=0,
             )
+            # Live indexer folds the fp8 per-128 scale into head_dim:
+            # head_dim = 128 + 128 // 128 * 4 = 132 (attention.py:283).
             idx = Glm5NextIndexerCache(
-                head_dim=INDEX_HEAD_DIM,
+                head_dim=INDEX_HEAD_DIM + INDEX_HEAD_DIM // 128 * 4,
                 dtype=INDEXER_DTYPE,
                 prefix=f"model.layers.{i}.self_attn.indexer",
                 cache_config=cache_config,
@@ -173,7 +175,7 @@ def test_indexer_spec_block_size_preserved(cfg_and_specs):
     """Indexer spec must stay on the model-wide block_size (2304); DeepGEMM
     page-tiling is a virtual split and must not change allocation accounting."""
     _, specs, _ = cfg_and_specs
-    idx_spec = specs["model.layers.0.self_attn.indexer"]
+    idx_spec = specs[f"model.layers.{FULL_ATTN_LAYERS[0]}.self_attn.indexer"]
     assert isinstance(idx_spec, MLAAttentionSpec)
     print(
         f"\nindexer spec: block_size={idx_spec.block_size} "
