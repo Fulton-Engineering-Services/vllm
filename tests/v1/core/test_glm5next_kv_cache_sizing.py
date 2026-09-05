@@ -52,16 +52,28 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
-# glm53-flash-tp4 deployment parameters (templates/vllm-glm53-flash-tp4.env.tmpl)
+# glm53-flash-tp4 deployment parameters (templates/vllm-glm53-flash-tp4.env.tmpl
+# and text_config of the LibertAIDAI/GLM-5.3-Flash-NVFP4 checkpoint).
 BLOCK_SIZE = 2304
 MAX_MODEL_LEN = 115_200
 NUM_HIDDEN_LAYERS = 45
-NUM_FULL_ATTN_LAYERS = 11  # full_attention_interval = 4 over 45 layers
+TP_SIZE = 4
+# text_config.linear_attn_config
+LINEAR_NUM_HEADS = 64
+LINEAR_HEAD_DIM = 128
+LINEAR_CONV_KERNEL = 4
+FULL_ATTN_LAYERS = [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43]
 INDEX_KPOOL = 4
 INDEX_HEAD_DIM = 128
 INDEXER_DTYPE = torch.uint8  # fp8 indexer cache
 KV_LORA_RANK = 512
 KV_CACHE_DTYPE = torch.uint8  # fp8_e4m3
+
+# KDA state shapes (mamba_utils.kda_state_shape, conv dim-first):
+#   conv = (conv_dim/tp, kernel-1+num_spec) = ((3*64*128)/4, 3) = (6144, 3) bf16
+#   recurrent = (heads/tp, head_dim, head_dim) = (16, 128, 128) fp32
+KDA_CONV_SHAPE = (LINEAR_NUM_HEADS * LINEAR_HEAD_DIM * 3 // TP_SIZE, LINEAR_CONV_KERNEL - 1)
+KDA_REC_SHAPE = (LINEAR_NUM_HEADS // TP_SIZE, LINEAR_HEAD_DIM, LINEAR_HEAD_DIM)
 
 # Observed on gx10-node1 boot (2026-09-05 09:27): "Available KV cache memory: 22.62 GiB"
 EXPECTED_AVAILABLE_GIB = 22.62
@@ -110,10 +122,9 @@ def _build_specs(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     """Mirror the model runner's per-layer spec construction."""
     cache_config = vllm_config.cache_config
     specs: dict[str, KVCacheSpec] = {}
-    full_layer_ids = [i for i in range(NUM_HIDDEN_LAYERS) if i % 4 == 0]
 
     for i in range(NUM_HIDDEN_LAYERS):
-        if i in full_layer_ids:
+        if i in FULL_ATTN_LAYERS:
             specs[f"model.layers.{i}.self_attn"] = MLAAttentionSpec(
                 block_size=BLOCK_SIZE,
                 num_kv_heads=1,
@@ -141,8 +152,8 @@ def _build_specs(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         else:
             specs[f"model.layers.{i}.linear_attn"] = MambaSpec(
                 block_size=BLOCK_SIZE,
-                shapes=((4096, 128),),
-                dtypes=(torch.bfloat16,),
+                shapes=(KDA_CONV_SHAPE, KDA_REC_SHAPE),
+                dtypes=(torch.bfloat16, torch.float32),
                 mamba_type=MambaAttentionBackendEnum.MAMBA2,
                 mamba_cache_mode="align",
             )
