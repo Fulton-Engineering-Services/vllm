@@ -46,7 +46,7 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90 import (
     FlashInferMLASparseSM90Backend,
 )
 from vllm.v1.attention.backends.mla.indexer import (
-    DeepseekV32IndexerBackend,
+    Glm5NextKpoolIndexerBackend,
     KpoolTailBackend,
 )
 from vllm.v1.core.kv_cache_utils import (
@@ -175,7 +175,7 @@ def _build_specs(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     for i in range(NUM_HIDDEN_LAYERS):
         if i in FULL_ATTN_LAYERS:
             backend_by_name[f"model.layers.{i}.self_attn"] = FlashInferMLASparseSM90Backend
-            backend_by_name[f"model.layers.{i}.self_attn.indexer"] = DeepseekV32IndexerBackend
+            backend_by_name[f"model.layers.{i}.self_attn.indexer"] = Glm5NextKpoolIndexerBackend
             backend_by_name[f"model.layers.{i}.self_attn.indexer.tail"] = KpoolTailBackend
     out: dict[str, KVCacheSpec] = {}
     for name, spec in specs.items():

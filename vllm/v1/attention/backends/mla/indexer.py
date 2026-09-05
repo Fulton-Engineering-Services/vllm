@@ -220,6 +220,26 @@ class B12xNonCompressedIndexerBackend(DeepseekV32IndexerBackend):
         return "B12X_NON_COMPRESSED_INDEXER"
 
 
+class Glm5NextKpoolIndexerBackend(DeepseekV32IndexerBackend):
+    """GLM-5.3-Flash kpool indexer.
+
+    The kpool indexer spec pins ``block_size = kernel_tile * index_kpool`` so
+    the runtime ``block_kv = block_size // index_kpool`` lands in DeepGEMM's
+    legal ``{32, 64}``. Advertising the spec's own block size (256 for
+    ``index_kpool = 4``) keeps ``select_common_block_size`` from splitting the
+    indexer block down to the base 64, which would make ``block_kv = 16`` and
+    trip the DeepGEMM paged-MQA assert (csrc/apis/attention.hpp:262).
+    """
+
+    @staticmethod
+    def get_name() -> str:
+        return "GLM5NEXT_KPOOL_INDEXER"
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        return [1, MultipleOf(16)] if current_platform.is_rocm() else [256]
+
+
 class KpoolTailBackend(DeepseekV32IndexerBackend):
     """Storage-only backend for the GLM-5.3-Flash kpool tail cache."""
 
