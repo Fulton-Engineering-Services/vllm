@@ -45,6 +45,10 @@ logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
+# Token-context ceiling for persistent_topk. Past ~24K tokens its FilteredTopK
+# fallback wants 128KB smem (over GB10's ~99KB opt-in max); stay safely under.
+_PERSISTENT_TOPK_MAX_TOKENS = 16384
+
 _PERSISTENT_TOPK_OP = None
 
 
@@ -851,7 +855,19 @@ def sparse_attn_indexer_kpool(
         else:
             topk_dst = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if current_platform.is_cuda() and select_k in (512, 1024, 2048):
+        # persistent_topk is numerically correct (day-0) but its FilteredTopK
+        # fallback needs 128KB smem, oversubscribing on low-SM GPUs (GB10: 48
+        # SMs, ~99KB opt-in max) once the batch's token context grows large.
+        # top_k_per_row_decode has no smem ceiling but corrupts output. Gate on
+        # the batch's actual token context, not SM count: persistent_topk for
+        # short/medium context, top_k_per_row_decode only past the threshold.
+        max_token_ctx = int(attn_metadata_narrowed.max_seq_len)
+        use_persistent_topk = (
+            current_platform.is_cuda()
+            and select_k in (512, 1024, 2048)
+            and max_token_ctx <= _PERSISTENT_TOPK_MAX_TOKENS
+        )
+        if use_persistent_topk:
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
