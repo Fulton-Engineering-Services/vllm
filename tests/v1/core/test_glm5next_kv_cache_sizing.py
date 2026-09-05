@@ -218,17 +218,24 @@ def test_indexer_spec_block_size_preserved(cfg_and_specs):
 
 def test_needed_memory_fits_reference_budget(cfg_and_specs):
     """A 115,200-token request must fit the profiled 22.62 GiB/rank budget."""
-    vllm_config, _, groups = cfg_and_specs
+    vllm_config, specs, groups = cfg_and_specs
     needed = _max_memory_usage_bytes_from_groups(vllm_config, groups)
     available = int(EXPECTED_AVAILABLE_GIB * (1 << 30))
     group_size = max(len(g.layer_names) for g in groups)
     page_sizes = sorted({g.kv_cache_spec.page_size_bytes for g in groups})
     print(f"\nneeded={needed / (1 << 30):.2f} GiB  available={available / (1 << 30):.2f} GiB")
     print(f"groups={len(groups)} group_size={group_size} page_sizes={page_sizes}")
+    for name, spec in specs.items():
+        if "layers.3." in name or "layers.0." in name:
+            print(
+                f"  {name}: type={type(spec).__name__} block_size={spec.block_size} "
+                f"page={spec.page_size_bytes} unpadded={getattr(spec, 'unpadded_page_size_bytes', 'n/a')}"
+            )
     for g in groups:
         print(
             f"  group: layers={len(g.layer_names)} type={type(g.kv_cache_spec).__name__} "
-            f"page={g.kv_cache_spec.page_size_bytes} block_size={g.kv_cache_spec.block_size}"
+            f"page={g.kv_cache_spec.page_size_bytes} block_size={g.kv_cache_spec.block_size} "
+            f"max_mem={g.kv_cache_spec.max_memory_usage_bytes(vllm_config)}"
         )
     print(f"per-token billed: {needed / MAX_MODEL_LEN:.0f} B/token/rank")
     assert needed < available, (
