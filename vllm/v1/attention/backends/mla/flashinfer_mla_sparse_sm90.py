@@ -77,6 +77,7 @@ def _maybe_dump_decode(
     topk_indices: torch.Tensor,
     topk_slots: torch.Tensor,
     out: torch.Tensor,
+    topk_buffer: torch.Tensor | None = None,
 ) -> None:
     import os
 
@@ -90,16 +91,20 @@ def _maybe_dump_decode(
 
     log = logging.getLogger("glm53.decode_dump")
     n = min(2, topk_indices.shape[0])
+    buf_ptr = (
+        f"{topk_buffer.data_ptr():#x}" if topk_buffer is not None else "n/a"
+    )
     ti = topk_indices[:n].detach().float().cpu()
     ts = topk_slots[:n].detach().cpu()
     ti_valid = (topk_indices[:n] >= 0).sum(dim=-1).cpu()
     ts_valid = (topk_slots[:n] >= 0).sum(dim=-1).cpu()
     o = out.detach().float()
     log.error(
-        "GLM53_DECODE_DUMP call=%d topk_idx[0:%d]=%s kv_slots[0:%d]=%s "
+        "GLM53_DECODE_DUMP call=%d buf=%s topk_idx[0:%d]=%s kv_slots[0:%d]=%s "
         "topk_valid=%s kv_valid=%s | out finite=%s mean=%.4f std=%.4f "
         "absmax=%.4f first=%s",
         _DECODE_DUMP_CALLS,
+        buf_ptr,
         n,
         ti[:1, :12].tolist(),
         n,
@@ -543,5 +548,5 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseMetadat
             else {}
         )
         out = state.wrapper.run(q_nope, q_pe, ckv, kpe, **scale_kwargs)
-        _maybe_dump_decode(topk_indices, topk_slots, out)
+        _maybe_dump_decode(topk_indices, topk_slots, out, self.topk_indices_buffer)
         return out, None

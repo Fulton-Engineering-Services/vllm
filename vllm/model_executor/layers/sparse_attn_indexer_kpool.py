@@ -64,10 +64,11 @@ def _maybe_dump_indexer(topk_indices_buffer: torch.Tensor, tag: str) -> None:
     ti = topk_indices_buffer[:n].detach().cpu()
     ti_valid = (topk_indices_buffer[:n] >= 0).sum(dim=-1).cpu()
     logger.error(
-        "GLM53_DECODE_DUMP indexer call=%d tag=%s topk_idx[0:%d]=%s valid=%s "
-        "shape=%s",
+        "GLM53_DECODE_DUMP indexer call=%d tag=%s buf=%#x topk_idx[0:%d]=%s "
+        "valid=%s shape=%s",
         _INDEXER_DUMP_CALLS,
         tag,
+        topk_indices_buffer.data_ptr(),
         n,
         ti[:1, :16].tolist(),
         ti_valid.tolist(),
