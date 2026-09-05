@@ -3142,6 +3142,36 @@ def test_glm5_next_indexer_decode_metadata_has_kpool_fields():
     assert required <= fields, f"missing: {required - fields}"
 
 
+def test_glm5_next_kpool_tail_kernel_block_size_is_pool_size():
+    """The kpool tail kernels index a [num_blocks, 2, pool_size, head_dim]
+    cache and assert shape[2] == index_kpool (kpool_compress.py). The kernel
+    block size must therefore be exactly index_kpool (4), not the
+    ratio-scaled manager block (3072) that page unification produces.
+
+    Regression for the 2026-09-05 glm53-flash-tp4 boot failure:
+    KpoolTailBackend advertised MultipleOf(1), so select_common_block_size
+    accepted the full 3072-token manager block (Case 1) and the reshape
+    built a [N, 2, 3072, 128] view, tripping
+    ``assert tail_kv_cache.shape[2] == pool_size`` in
+    kpool_decode_update_and_maybe_write_cache_batched during the warmup
+    dummy run. A literal [4] forces virtual block splitting
+    (blocks_per_kv_block = 3072/4 = 768), matching the kernels'
+    pool-granular slot arithmetic (block * kpool + pos % kpool).
+    """
+    from vllm.v1.attention.backends.mla.indexer import KpoolTailBackend
+    from vllm.v1.worker.utils import select_common_block_size
+
+    # Any multiple of 4 the manager block could be must resolve to 4.
+    for manager_block in (4, 256, 3072):
+        assert select_common_block_size(manager_block, [KpoolTailBackend]) == 4, (
+            manager_block
+        )
+
+    # And the cache shape derived from it keeps pool_size in dim 2.
+    shape = KpoolTailBackend.get_kv_cache_shape(768, 4, 2, 128)
+    assert shape == (768, 2, 4, 128)
+
+
 def test_glm5_next_kpool_tail_builder_never_schedules_deepgemm():
     """The storage-only kpool tail cache must not schedule DeepGEMM
     paged-MQA work: its spec ratio-scales to the model's unified block size

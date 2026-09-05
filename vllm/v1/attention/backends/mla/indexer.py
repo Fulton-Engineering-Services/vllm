@@ -255,7 +255,16 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [MultipleOf(1)]
+        # The tail kernels index [num_blocks, 2, pool_size, head_dim] and
+        # assert shape[2] == index_kpool (kpool_compress.py), so the kernel
+        # block size must be exactly the pool size (4 for GLM-5.3-Flash).
+        # MultipleOf(1) let select_common_block_size pick the full
+        # ratio-scaled manager block (e.g. 3072), producing a [N, 2, 3072,
+        # 128] cache view that fails the assert. A literal size forces
+        # virtual block splitting (blocks_per_kv_block = 3072/4), matching
+        # the tail kernels' pool-granular slot arithmetic
+        # (block * kpool + pos % kpool).
+        return [4]
 
 
 @dataclass
