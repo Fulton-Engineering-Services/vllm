@@ -67,15 +67,14 @@ EXPECTED_AVAILABLE_GIB = 22.62
 
 
 def _vllm_config() -> VllmConfig:
+    # ModelConfig validates the model path at construction; the sizing code only
+    # reads max_model_len/original_max_model_len, so stub it without touching the
+    # network or the model dir.
+    model_config = ModelConfig.__new__(ModelConfig)
+    object.__setattr__(model_config, "max_model_len", MAX_MODEL_LEN)
+    object.__setattr__(model_config, "original_max_model_len", MAX_MODEL_LEN)
     return VllmConfig(
-        model_config=ModelConfig(
-            model="zai-org/GLM-5.3-Flash",
-            tokenizer="zai-org/GLM-5.3-Flash",
-            trust_remote_code=True,
-            dtype="bfloat16",
-            seed=0,
-            max_model_len=MAX_MODEL_LEN,
-        ),
+        model_config=model_config,
         cache_config=CacheConfig(
             block_size=BLOCK_SIZE,
             gpu_memory_utilization=0.75,
