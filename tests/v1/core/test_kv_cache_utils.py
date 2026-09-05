@@ -3109,6 +3109,39 @@ def test_glm5_next_indexer_prefill_metadata_has_max_prefill_seq_len():
     assert meta.max_prefill_seq_len == -1
 
 
+def test_glm5_next_indexer_decode_metadata_has_kpool_fields():
+    """The kpool indexer op's decode-write path reads
+    decode_metadata.per_req_decode_lens / decode_is_uniform /
+    write_max_decode_len to group tokens by request without a device sync
+    (a runtime .item() would break cudagraph capture). These fields existed
+    in the GLM-5.3-Flash support branch's indexer (773feda184) but were
+    dropped when the cu133 fork rebased onto the newer upstream indexer,
+    crashing the warmup dummy run with ``AttributeError:
+    'DeepSeekV32IndexerDecodeMetadata' object has no attribute
+    'per_req_decode_lens'``. Pin the dataclass contract against the full
+    field set the op reads.
+    """
+    import dataclasses
+
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepSeekV32IndexerDecodeMetadata,
+    )
+
+    fields = {f.name for f in dataclasses.fields(DeepSeekV32IndexerDecodeMetadata)}
+    # Everything sparse_attn_indexer_kpool.py reads from decode_metadata.
+    required = {
+        "block_table",
+        "seq_lens",
+        "decode_lens",
+        "requires_padding",
+        "schedule_metadata",
+        "per_req_decode_lens",
+        "decode_is_uniform",
+        "write_max_decode_len",
+    }
+    assert required <= fields, f"missing: {required - fields}"
+
+
 def test_glm5_next_kpool_tail_builder_never_schedules_deepgemm():
     """The storage-only kpool tail cache must not schedule DeepGEMM
     paged-MQA work: its spec ratio-scales to the model's unified block size
