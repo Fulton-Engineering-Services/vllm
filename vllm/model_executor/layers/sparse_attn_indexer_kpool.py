@@ -45,6 +45,35 @@ logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
+# Env-gated decode-path value dump (GLM53_DECODE_DUMP=1): logs the indexer's
+# produced topk_indices for the first _DUMP_MAX calls per rank. Pairs with the
+# SM90-backend dump (same env var) to A/B what the indexer emits vs what the
+# attention consumes, localizing the SM121 decode corruption.
+_INDEXER_DUMP_CALLS = 0
+_INDEXER_DUMP_MAX_CALLS = 4
+
+
+def _maybe_dump_indexer(topk_indices_buffer: torch.Tensor, tag: str) -> None:
+    global _INDEXER_DUMP_CALLS
+    if os.environ.get("GLM53_DECODE_DUMP") != "1":
+        return
+    if _INDEXER_DUMP_CALLS >= _INDEXER_DUMP_MAX_CALLS:
+        return
+    _INDEXER_DUMP_CALLS += 1
+    n = min(2, topk_indices_buffer.shape[0])
+    ti = topk_indices_buffer[:n].detach().cpu()
+    ti_valid = (topk_indices_buffer[:n] >= 0).sum(dim=-1).cpu()
+    logger.error(
+        "GLM53_DECODE_DUMP indexer call=%d tag=%s topk_idx[0:%d]=%s valid=%s "
+        "shape=%s",
+        _INDEXER_DUMP_CALLS,
+        tag,
+        n,
+        ti[:1, :16].tolist(),
+        ti_valid.tolist(),
+        tuple(topk_indices_buffer.shape),
+    )
+
 # Token-context ceiling for persistent_topk. Past ~24K tokens its FilteredTopK
 # fallback wants 128KB smem (over GB10's ~99KB opt-in max); stay safely under.
 _PERSISTENT_TOPK_MAX_TOKENS = 16384
@@ -934,6 +963,7 @@ def sparse_attn_indexer_kpool(
                 out.reshape(batch_size, -1, out.shape[-1]), decode_lens
             )
         topk_indices_buffer[: out.shape[0], : out.shape[-1]] = out
+        _maybe_dump_indexer(topk_indices_buffer, "decode")
 
     return topk_indices_buffer
 

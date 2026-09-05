@@ -64,6 +64,55 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 _FP8_KV_DTYPES = ("fp8", "fp8_e4m3")
 _WORKSPACE_BYTES = 128 * 1024 * 1024
 
+# Env-gated decode-path value dump (GLM53_DECODE_DUMP=1): logs topk_indices,
+# the post-conversion kv_indices, and attention-output stats for the first
+# _DUMP_MAX_CALLS decode steps per rank. Localizes the SM121 decode corruption
+# (first-token-correct-then-collapse). Inert unless the env var is set; the
+# device syncs it forces make it unsuitable for production.
+_DECODE_DUMP_CALLS = 0
+_DECODE_DUMP_MAX_CALLS = 4
+
+
+def _maybe_dump_decode(
+    topk_indices: torch.Tensor,
+    topk_slots: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    import os
+
+    global _DECODE_DUMP_CALLS
+    if os.environ.get("GLM53_DECODE_DUMP") != "1":
+        return
+    if _DECODE_DUMP_CALLS >= _DECODE_DUMP_MAX_CALLS:
+        return
+    _DECODE_DUMP_CALLS += 1
+    import logging
+
+    log = logging.getLogger("glm53.decode_dump")
+    n = min(2, topk_indices.shape[0])
+    ti = topk_indices[:n].detach().float().cpu()
+    ts = topk_slots[:n].detach().cpu()
+    ti_valid = (topk_indices[:n] >= 0).sum(dim=-1).cpu()
+    ts_valid = (topk_slots[:n] >= 0).sum(dim=-1).cpu()
+    o = out.detach().float()
+    log.error(
+        "GLM53_DECODE_DUMP call=%d topk_idx[0:%d]=%s kv_slots[0:%d]=%s "
+        "topk_valid=%s kv_valid=%s | out finite=%s mean=%.4f std=%.4f "
+        "absmax=%.4f first=%s",
+        _DECODE_DUMP_CALLS,
+        n,
+        ti[:1, :12].tolist(),
+        n,
+        ts[:1, :12].tolist(),
+        ti_valid.tolist(),
+        ts_valid.tolist(),
+        bool(torch.isfinite(o).all().item()),
+        float(o.mean().item()),
+        float(o.std().item()),
+        float(o.abs().max().item()),
+        o.flatten()[:6].tolist(),
+    )
+
 # The BatchMLAPagedAttentionWrapper keeps its plan/schedule state inside the
 # workspace between plan() and run() (across layers and steps, including CUDA
 # graph replays). The shared step workspace is clobbered by the indexer and
@@ -494,4 +543,5 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseMetadat
             else {}
         )
         out = state.wrapper.run(q_nope, q_pe, ckv, kpe, **scale_kwargs)
+        _maybe_dump_decode(topk_indices, topk_slots, out)
         return out, None
