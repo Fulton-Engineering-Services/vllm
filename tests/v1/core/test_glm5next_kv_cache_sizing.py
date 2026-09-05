@@ -70,7 +70,14 @@ def _vllm_config() -> VllmConfig:
     # ModelConfig() with no model id skips HF loading (mirrors the pattern in
     # tests/v1/core/test_kv_cache_utils.py). Only the fields the sizing code
     # reads are overridden.
-    model_config = ModelConfig(max_model_len=MAX_MODEL_LEN)
+    model_config = ModelConfig(
+        model="/model",
+        tokenizer="/model",
+        trust_remote_code=True,
+        dtype="bfloat16",
+        seed=0,
+        max_model_len=MAX_MODEL_LEN,
+    )
     cache_config = CacheConfig(
         block_size=BLOCK_SIZE,
         gpu_memory_utilization=0.75,
