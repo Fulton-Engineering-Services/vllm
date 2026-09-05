@@ -58,6 +58,7 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
+from vllm.v1.attention.backends.utils import KVCacheLayoutType
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 _FP8_KV_DTYPES = ("fp8", "fp8_e4m3")
@@ -165,6 +166,10 @@ class FlashInferMLASparseSM90Backend(AttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         return (num_blocks, block_size, head_size)
+
+    @classmethod
+    def get_required_kv_cache_layout(cls) -> "KVCacheLayoutType | None":
+        return "HND"
 
 
 class _SM90State:
