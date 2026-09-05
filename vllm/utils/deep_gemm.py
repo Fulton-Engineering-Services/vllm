@@ -509,221 +509,6 @@ def transform_sf_into_required_layout(*args, **kwargs):
     )
 
 
-def _dequant_fp4_q_for_sm121(
-    q: tuple[torch.Tensor, torch.Tensor | None],
-    head_dim: int,
-) -> tuple[torch.Tensor, None]:
-    """Dequantize FP4 Q to FP8 for SM121 SM90-kernel compatibility.
-
-    Returns (q_fp8, None) suitable for the FP8 dispatch path.
-    Only dequantizes Q — KV cache conversion is handled separately for the
-    paged decode path.
-    """
-    q_vals, q_scale = q
-    if q_scale is None:
-        return q
-
-    assert q_vals.dtype in (torch.uint8, torch.int8), (
-        f"expected uint8/int8 FP4 Q, got {q_vals.dtype}"
-    )
-    assert q_scale.dtype == torch.int32, (
-        f"expected int32 UE8M0 Q scale, got {q_scale.dtype}"
-    )
-
-    batch_size, next_n, num_heads, packed_dim = q_vals.shape
-    assert packed_dim * 2 == head_dim, (
-        f"packed dim {packed_dim} * 2 != head_dim {head_dim}"
-    )
-
-    vals_f32 = q_vals.view(torch.uint8).to(torch.float32)
-    lo = vals_f32 % 16
-    hi = vals_f32 // 16
-    fp4_unpacked = torch.stack([lo, hi], dim=-1).reshape(
-        batch_size, next_n, num_heads, head_dim
-    )
-
-    num_scale_groups = head_dim // 32
-    shifts = torch.tensor(
-        [0, 8, 16, 24],
-        dtype=torch.int32,
-        device=q_scale.device,
-    )[:num_scale_groups]
-    scale_bytes = (
-        (q_scale.unsqueeze(-1) >> shifts) & 0xFF
-    ).to(torch.float32)
-    scale_f32 = torch.where(
-        scale_bytes > 0,
-        torch.pow(2.0, scale_bytes - 127.0),
-        torch.tensor(0.0, device=scale_bytes.device, dtype=torch.float32),
-    )
-
-    scale_f32 = scale_f32.reshape(batch_size, next_n, num_heads, num_scale_groups)
-    scale_bc = scale_f32.repeat_interleave(32, dim=-1)
-
-    fp32_vals = fp4_unpacked * scale_bc
-
-    fp32_flat = fp32_vals.reshape(-1, head_dim)
-    max_abs = fp32_flat.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-12)
-    fp8_scale_fold = max_abs / 448.0
-    fp8_vals = (fp32_flat / fp8_scale_fold).clamp(-448.0, 448.0).to(
-        torch.float8_e4m3fn
-    )
-    fp8_vals = fp8_vals.reshape(batch_size, next_n, num_heads, head_dim)
-
-    return (fp8_vals, None)
-
-
-def _convert_fp4_fused_kv_cache_to_fp8(
-    fused_kv_cache: torch.Tensor,
-    head_dim: int,
-) -> torch.Tensor:
-    """Convert FP4-format fused KV cache to FP8 format for SM121 SM90 compat.
-
-    FP4 physical layout per block:
-      [block_kv * head_dim//2 bytes: packed FP4 values (positions contiguous)]
-      [block_kv * 4 bytes: int32 UE8M0 scales (one per position)]
-
-    FP8 physical layout per block:
-      [block_kv * head_dim bytes: float8_e4m3fn values (positions contiguous)]
-      [block_kv * 4 bytes: float32 scales (one per position)]
-
-    The tensor view stride(1)=head_dim//2+4 is a naive row-major view over the
-    flat byte buffer.  We create as_strided views that correctly skip the
-    scale section, matching the from_blob logic in the C++ dispatch.
-    """
-    num_kv_blocks, block_kv, _, fp4_row_bytes = fused_kv_cache.shape
-    fp4_val_bytes = fp4_row_bytes - 4
-    assert fp4_val_bytes * 2 == head_dim, (
-        f"fp4_val_bytes {fp4_val_bytes} * 2 != head_dim {head_dim}"
-    )
-
-    device = fused_kv_cache.device
-    kv_block_stride = fused_kv_cache.stride(0)
-
-    fp4_vals = torch.as_strided(
-        fused_kv_cache,
-        size=(num_kv_blocks, block_kv, fp4_val_bytes),
-        stride=(kv_block_stride, fp4_val_bytes, 1),
-    )
-
-    fp4_sf = torch.as_strided(
-        fused_kv_cache,
-        size=(num_kv_blocks, block_kv, 4),
-        stride=(kv_block_stride, 4, 1),
-        storage_offset=fused_kv_cache.storage_offset()
-        + block_kv * fp4_val_bytes,
-    )
-
-    fp4_lo = fp4_vals.bitwise_and(15).to(torch.float32)
-    fp4_hi = fp4_vals.bitwise_right_shift(4).to(torch.float32)
-    fp4_unpacked = torch.stack([fp4_lo, fp4_hi], dim=-1).reshape(
-        num_kv_blocks, block_kv, head_dim
-    )
-
-    sf_int32 = fp4_sf.contiguous().view(torch.int32).squeeze(-1)
-
-    num_scale_groups = head_dim // 32
-    shifts = torch.tensor(
-        [0, 8, 16, 24],
-        dtype=torch.int32,
-        device=device,
-    )[:num_scale_groups]
-    sf_ue8m0 = ((sf_int32.unsqueeze(-1) >> shifts) & 0xFF).to(torch.float32)
-    sf_f32 = torch.where(
-        sf_ue8m0 > 0,
-        torch.pow(2.0, sf_ue8m0 - 127.0),
-        torch.tensor(0.0, device=device, dtype=torch.float32),
-    )
-
-    sf_bc = sf_f32.repeat_interleave(32, dim=-1)
-
-    fp32_vals = fp4_unpacked * sf_bc
-
-    fp32_flat = fp32_vals.reshape(-1, head_dim)
-    max_abs = fp32_flat.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-12)
-    fp8_scale = max_abs / 448.0
-    fp8_vals = (fp32_flat / fp8_scale).clamp(-448.0, 448.0).to(
-        torch.float8_e4m3fn
-    )
-    fp8_vals = fp8_vals.reshape(num_kv_blocks, block_kv, head_dim)
-
-    out = torch.zeros(
-        num_kv_blocks,
-        block_kv,
-        1,
-        head_dim + 4,
-        dtype=torch.uint8,
-        device=device,
-    )
-
-    out_vals = torch.as_strided(
-        out,
-        size=(num_kv_blocks, block_kv, head_dim),
-        stride=(out.stride(0), head_dim, 1),
-    )
-    out_vals.copy_(fp8_vals.view(torch.uint8))
-
-    out_sf = torch.as_strided(
-        out,
-        size=(num_kv_blocks, block_kv, 4),
-        stride=(out.stride(0), 4, 1),
-        storage_offset=out.storage_offset() + block_kv * head_dim,
-    )
-    out_sf.copy_(fp8_scale.reshape(num_kv_blocks, block_kv, 1).view(torch.uint8))
-
-    return out
-
-
-def _dequant_fp4_qkv_for_sm121(
-    q: tuple[torch.Tensor, torch.Tensor | None],
-    kv: tuple[torch.Tensor, torch.Tensor],
-) -> tuple[tuple[torch.Tensor, None], tuple[torch.Tensor, torch.Tensor]]:
-    """Dequantize FP4 Q and KV to FP8 for SM121 SM90-kernel compatibility.
-
-    SM121 routes through SM90 (wgmma) kernels which only accept FP8 inputs.
-    Converts packed-FP4 (uint8) + UE8M0 (int32) scales to FP8 (float8_e4m3fn)
-    values + FP32 scales.
-    """
-    q_vals, q_scale = q
-    kv_vals, kv_scale = kv
-    if q_scale is None:
-        return q, kv
-
-    assert q_vals.dtype == torch.uint8
-    assert q_scale.dtype == torch.int32
-    assert kv_vals.dtype == torch.uint8
-    assert kv_scale.dtype == torch.int32
-
-    def _fp4_packed_to_fp8(
-        packed: torch.Tensor, ue8m0: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        packed_f32 = packed.to(torch.float32)
-        lo = (packed_f32 % 16).to(torch.float32)
-        hi = (packed_f32 // 16).to(torch.float32)
-        vals = torch.stack([lo, hi], dim=-1).flatten(-2)
-
-        scales_s32 = ue8m0.to(torch.int32)
-        shifts = torch.tensor([0, 8, 16, 24], dtype=torch.int32, device=scales_s32.device)
-        bytes_t = ((scales_s32.unsqueeze(-1) >> shifts) & 0xFF).to(torch.float32)
-        exp2 = torch.where(bytes_t > 0, torch.exp2(bytes_t - 127.0), torch.tensor(0.0, device=bytes_t.device))
-
-        D = vals.shape[-1]
-        block_scale = exp2.flatten(-2)
-        block_scale = block_scale.repeat_interleave(32, dim=-1)
-        pad = (D + 127) // 128 * 128 - D
-        if pad > 0:
-            block_scale = block_scale[..., :D]
-
-        fp32 = vals * block_scale
-        max_abs = fp32.abs().max()
-        scale = max_abs / 448.0 if max_abs > 0 else 1.0
-        fp8 = (fp32 / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-        fp8_scale = torch.tensor([scale], dtype=torch.float32, device=fp32.device)
-        return fp8, fp8_scale
-
-    q_vals_fp8, q_scale_fp8 = _fp4_packed_to_fp8(q_vals, q_scale)
-    kv_vals_fp8, kv_scale_fp8 = _fp4_packed_to_fp8(kv_vals, kv_scale)
-    return (q_vals_fp8, None), (kv_vals_fp8, kv_scale_fp8)
 
 
 def fp8_fp4_mqa_logits(
@@ -761,9 +546,6 @@ def fp8_fp4_mqa_logits(
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
         return _missing()
-
-    if q[1] is not None and current_platform.is_device_capability_family(120):
-        q, kv = _dequant_fp4_qkv_for_sm121(q, kv)
 
     return _fp8_fp4_mqa_logits_impl(
         q,
@@ -872,13 +654,13 @@ def fp8_fp4_paged_mqa_logits(
     if _fp8_fp4_paged_mqa_logits_impl is None:
         return _missing()
 
-    if q[1] is not None and current_platform.is_device_capability_family(120):
-        fp4_val_bytes = kv_cache.shape[-1] - 4
-        head_dim = fp4_val_bytes * 2
-        q = _dequant_fp4_q_for_sm121(q, head_dim)
-        kv_cache = _convert_fp4_fused_kv_cache_to_fp8(kv_cache, head_dim)
-        # FP8 Q has no per-token scale tuple — fold into weights.
-        # The C++ SM90 path handles q_scale=None natively.
+    # DeepGEMM asserts block_tables.stride(-1)==1. A trailing size-1 dim
+    # (e.g. block_table shape [B,1] for short seqs under a large block_size)
+    # can be a transposed view where .contiguous() is a no-op (torch treats the
+    # size-1 dim's stride as irrelevant) yet stride(-1)!=1, failing the kernel.
+    # clone to contiguous format to force stride(-1)==1.
+    if block_tables.dim() >= 2 and block_tables.stride(-1) != 1:
+        block_tables = block_tables.clone(memory_format=torch.contiguous_format)
 
     kwargs = {} if indices is None else {"indices": indices}
     return _fp8_fp4_paged_mqa_logits_impl(
