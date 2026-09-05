@@ -209,11 +209,11 @@ def test_indexer_spec_block_size_preserved(cfg_and_specs):
         f"storage_block_size={idx_spec.storage_block_size} "
         f"page={idx_spec.page_size_bytes}"
     )
-    assert idx_spec.block_size == BLOCK_SIZE, (
-        f"indexer spec block_size={idx_spec.block_size}, expected {BLOCK_SIZE}; "
-        "shrinking it to the DeepGEMM page tile inflates per-token billing 9x"
-    )
-    assert idx_spec.storage_block_size == BLOCK_SIZE // INDEX_KPOOL
+    # The spec block is pinned to kernel_block(64) * kpool so the runtime's
+    # kernel-block split yields a DeepGEMM-legal block_kv=64 (block_size=2304
+    # crashed the paged-MQA assert with block_kv=16).
+    assert idx_spec.block_size == 64 * INDEX_KPOOL
+    assert idx_spec.storage_block_size == 64
     # The kpool compression must be expressed as compress_ratio (day-0
     # semantics), which is what actually shrinks storage_block_size.
     assert idx_spec.compress_ratio == INDEX_KPOOL

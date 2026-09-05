@@ -124,30 +124,27 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         from dataclasses import replace
 
         spec = super().get_kv_cache_spec(vllm_config)
-        # ``compress_ratio = index_kpool`` makes vLLM's indexer metadata builder
-        # emit pool-granular slot_mapping / page_table and shrinks the cache
-        # allocation to ``storage_block_size = block_size // kpool`` -- the
-        # day-0 semantics. Do NOT shrink ``block_size`` to the DeepGEMM page
-        # tile here: that is a *virtual* split of the storage block, and
-        # shrinking the spec's block_size makes the hybrid-KV page unification
-        # pad this layer's small page up to the MLA page while billing at the
-        # tiny block_size, inflating the per-token KV cost ~9x (the glm53-flash
-        # 22.8 GiB @ 115K-token sizing failure).
+        # ``compress_ratio = index_kpool`` shrinks the cache allocation to
+        # ``storage_block_size = block_size // kpool`` (day-0 semantics). The
+        # indexer block is then virtually split to the DeepGEMM kernel block
+        # (``get_supported_kernel_block_sizes() == [64]``), so the runtime
+        # builder sees ``block_kv = kernel_block_size // compress_ratio``. For
+        # that to stay in DeepGEMM's legal {32, 64}, the spec's block_size must
+        # be the kernel block (64) * kpool, i.e. 256 for kpool=4 -- NOT the
+        # model-wide 2304. Setting block_size=2304 made block_kv=16 and crashed
+        # the DeepGEMM paged-MQA assert (csrc/apis/attention.hpp:262).
         assert isinstance(spec, MLAAttentionSpec)
         spec = replace(spec, compress_ratio=self._index_kpool)
 
-        # DeepGEMM paged-MQA takes block_kv in {32, 64}; the storage block
-        # (= block_size // index_kpool) is virtually split into pool pages of
-        # the largest such size that tiles it, so it must be a multiple of 32.
+        # DeepGEMM paged-MQA takes block_kv in {32, 64}. Pin the spec block to
+        # the largest kernel tile * kpool so the runtime's kernel-block split
+        # yields block_kv == 64.
+        kernel_block = max(PAGED_MQA_PAGE_SIZES)  # 64
+        spec = replace(spec, block_size=kernel_block * self._index_kpool)
         storage_block_size = spec.block_size // self._index_kpool
-        assert (
-            spec.block_size % self._index_kpool == 0 and storage_block_size % 32 == 0
-        ), (
-            "Glm5NextIndexerCache: kpool indexer requires cache block_size to "
-            f"be a multiple of index_kpool * 32 ({self._index_kpool * 32}) so "
-            "that DeepGEMM paged-MQA pool pages (32 or 64 entries) tile the "
-            f"storage block, got block_size={spec.block_size} -> "
-            f"storage_block_size={storage_block_size}."
+        assert storage_block_size in PAGED_MQA_PAGE_SIZES, (
+            f"Glm5NextIndexerCache: storage_block_size={storage_block_size} "
+            f"must be a DeepGEMM page tile {PAGED_MQA_PAGE_SIZES}"
         )
         return spec
 
