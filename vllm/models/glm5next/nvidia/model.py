@@ -4,6 +4,7 @@
 from collections.abc import Iterable
 from typing import ClassVar, Literal
 
+import os
 import torch
 from torch import nn
 
@@ -93,6 +94,48 @@ from .multimodal import (
 )
 
 logger = init_logger(__name__)
+
+
+# Env-gated NaN localizer (GLM53_NAN_DEBUG=1): forward hook on every submodule
+# of Glm5NextModel, logging the first module whose output goes non-finite.
+# GLM-5.3-Flash on SM12x has multiple NaN classes; this is the diagnostic.
+# Inert unless the env var is set. Ported from the day-0 fleet image's
+# Dockerfile.glm53-sm121-v2 debug patch.
+_NAN_SEEN: set = set()
+
+
+def _install_nan_hooks(model):
+    import torch as _t
+
+    _log = init_logger("glm53.nandebug")
+
+    def _mk(name):
+        def _hook(_mod, _inp, out):
+            def _chk(x):
+                if isinstance(x, _t.Tensor) and x.is_floating_point():
+                    bad = (~_t.isfinite(x.float())).sum().item()
+                    if bad and name not in _NAN_SEEN:
+                        _NAN_SEEN.add(name)
+                        _log.error(
+                            "NANDEBUG first non-finite output in %s (%d bad / %d)",
+                            name,
+                            bad,
+                            x.numel(),
+                        )
+
+            if isinstance(out, tuple):
+                for o in out:
+                    _chk(o)
+            else:
+                _chk(out)
+
+        return _hook
+
+    n_mod = 0
+    for n, m in model.named_modules():
+        m.register_forward_hook(_mk(n))
+        n_mod += 1
+    _log.warning("NANDEBUG hooks installed on %d modules", n_mod)
 
 
 class Glm5NextMLP(nn.Module):
@@ -648,6 +691,9 @@ class Glm5NextModel(nn.Module):
         assert config.num_attention_heads % world_size == 0, (
             "num_attention_heads must be divisible by world_size"
         )
+
+        if os.environ.get("GLM53_NAN_DEBUG") == "1":
+            _install_nan_hooks(self)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
