@@ -40,12 +40,22 @@ from vllm.models.glm5next.nvidia.attention import (
     Glm5NextIndexerCache,
     Glm5NextTailCache,
 )
+from dataclasses import replace
+
+from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90 import (
+    FlashInferMLASparseSM90Backend,
+)
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerBackend,
+    KpoolTailBackend,
+)
 from vllm.v1.core.kv_cache_utils import (
     _check_enough_kv_cache_memory,
     _max_memory_usage_bytes_from_groups,
     get_kv_cache_groups,
 )
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     KVCacheSpec,
     MambaAttentionBackendEnum,
     MambaSpec,
@@ -159,7 +169,22 @@ def _build_specs(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 mamba_type=MambaAttentionBackendEnum.MAMBA2,
                 mamba_cache_mode="align",
             )
-    return specs
+    # Mirror gpu_model_runner: annotate each attention spec with its backend's
+    # indexes_kv_by_block_stride and apply backend.customize_spec.
+    backend_by_name = {}
+    for i in range(NUM_HIDDEN_LAYERS):
+        if i in FULL_ATTN_LAYERS:
+            backend_by_name[f"model.layers.{i}.self_attn"] = FlashInferMLASparseSM90Backend
+            backend_by_name[f"model.layers.{i}.self_attn.indexer"] = DeepseekV32IndexerBackend
+            backend_by_name[f"model.layers.{i}.self_attn.indexer.tail"] = KpoolTailBackend
+    out: dict[str, KVCacheSpec] = {}
+    for name, spec in specs.items():
+        backend = backend_by_name.get(name)
+        if backend is not None and isinstance(spec, AttentionSpec):
+            spec = replace(spec, indexes_kv_by_block_stride=backend.indexes_kv_by_block_stride())
+            spec = backend.customize_spec(spec)
+        out[name] = spec
+    return out
 
 
 @pytest.fixture(scope="module")
