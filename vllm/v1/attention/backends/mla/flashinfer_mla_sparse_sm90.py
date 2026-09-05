@@ -70,7 +70,7 @@ _WORKSPACE_BYTES = 128 * 1024 * 1024
 # (first-token-correct-then-collapse). Inert unless the env var is set; the
 # device syncs it forces make it unsuitable for production.
 _DECODE_DUMP_CALLS = 0
-_DECODE_DUMP_MAX_CALLS = 4
+_DECODE_DUMP_MAX_CALLS = 16
 
 
 def _maybe_dump_decode(
@@ -100,11 +100,12 @@ def _maybe_dump_decode(
     ts_valid = (topk_slots[:n] >= 0).sum(dim=-1).cpu()
     o = out.detach().float()
     log.error(
-        "GLM53_DECODE_DUMP call=%d buf=%s topk_idx[0:%d]=%s kv_slots[0:%d]=%s "
-        "topk_valid=%s kv_valid=%s | out finite=%s mean=%.4f std=%.4f "
-        "absmax=%.4f first=%s",
+        "GLM53_DECODE_DUMP call=%d buf=%s ntok=%d topk_idx[0:%d]=%s "
+        "kv_slots[0:%d]=%s topk_valid=%s kv_valid=%s | out finite=%s mean=%.4f "
+        "std=%.4f absmax=%.4f first=%s",
         _DECODE_DUMP_CALLS,
         buf_ptr,
+        int(topk_indices.shape[0]),
         n,
         ti[:1, :12].tolist(),
         n,

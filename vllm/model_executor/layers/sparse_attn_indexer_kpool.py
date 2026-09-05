@@ -50,7 +50,7 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 # SM90-backend dump (same env var) to A/B what the indexer emits vs what the
 # attention consumes, localizing the SM121 decode corruption.
 _INDEXER_DUMP_CALLS = 0
-_INDEXER_DUMP_MAX_CALLS = 4
+_INDEXER_DUMP_MAX_CALLS = 16
 
 
 def _maybe_dump_indexer(topk_indices_buffer: torch.Tensor, tag: str) -> None:
