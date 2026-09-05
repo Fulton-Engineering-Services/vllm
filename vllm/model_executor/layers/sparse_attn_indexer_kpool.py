@@ -851,11 +851,7 @@ def sparse_attn_indexer_kpool(
         else:
             topk_dst = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if (
-            current_platform.is_cuda()
-            and select_k in (512, 1024, 2048)
-            and torch.cuda.get_device_properties(0).multi_processor_count >= 78
-        ):
+        if current_platform.is_cuda() and select_k in (512, 1024, 2048):
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
