@@ -720,7 +720,9 @@ class CudaPlatformBase(Platform):
             major, _ = torch.cuda.get_device_capability(device)
         except Exception:
             return False
-        return major >= 9
+        # PDL lowering is unvalidated on SM12x (GB10) and races on KDA
+        # state kernels there; keep it to Hopper/Blackwell-datacenter.
+        return major in (9, 10)
 
 
 # NVML utils
