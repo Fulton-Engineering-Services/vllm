@@ -75,10 +75,6 @@ def _maybe_dump_indexer(topk_indices_buffer: torch.Tensor, tag: str) -> None:
         tuple(topk_indices_buffer.shape),
     )
 
-# Token-context ceiling for persistent_topk. Past ~24K tokens its FilteredTopK
-# fallback wants 128KB smem (over GB10's ~99KB opt-in max); stay safely under.
-_PERSISTENT_TOPK_MAX_TOKENS = 16384
-
 _PERSISTENT_TOPK_OP = None
 
 
@@ -885,17 +881,17 @@ def sparse_attn_indexer_kpool(
         else:
             topk_dst = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        # persistent_topk is numerically correct (day-0) but its FilteredTopK
-        # fallback needs 128KB smem, oversubscribing on low-SM GPUs (GB10: 48
-        # SMs, ~99KB opt-in max) once the batch's token context grows large.
-        # top_k_per_row_decode has no smem ceiling but corrupts output. Gate on
-        # the batch's actual token context, not SM count: persistent_topk for
-        # short/medium context, top_k_per_row_decode only past the threshold.
-        max_token_ctx = int(attn_metadata_narrowed.max_seq_len)
+        # persistent_topk's FilteredTopK fallback needs 128KB smem and
+        # oversubscribes on low-SM GPUs (GB10: 48 SMs, ~99KB opt-in max),
+        # producing corrupt topk indices -> first-token-correct-then-degenerate
+        # output. Day-0 (sparse_attn_indexer_kpool_sm121.py:816) gates on SM
+        # count, routing small-SM parts (<78 SMs, i.e. all GB10) to
+        # top_k_per_row_decode unconditionally. Gate on SM count, not token
+        # context.
         use_persistent_topk = (
             current_platform.is_cuda()
             and select_k in (512, 1024, 2048)
-            and max_token_ctx <= _PERSISTENT_TOPK_MAX_TOKENS
+            and torch.cuda.get_device_properties(0).multi_processor_count >= 78
         )
         if use_persistent_topk:
             workspace_manager = current_workspace_manager()
