@@ -78,6 +78,8 @@ def _maybe_dump_decode(
     topk_slots: torch.Tensor,
     out: torch.Tensor,
     topk_buffer: torch.Tensor | None = None,
+    q_nope: torch.Tensor | None = None,
+    ckv: torch.Tensor | None = None,
 ) -> None:
     import os
 
@@ -99,10 +101,28 @@ def _maybe_dump_decode(
     ti_valid = (topk_indices[:n] >= 0).sum(dim=-1).cpu()
     ts_valid = (topk_slots[:n] >= 0).sum(dim=-1).cpu()
     o = out.detach().float()
+    extras = ""
+    if q_nope is not None:
+        qf = q_nope.detach().float()
+        extras += (
+            f" | q finite={bool(torch.isfinite(qf).all().item())}"
+            f" absmax={float(qf.abs().max().item()):.4f}"
+        )
+    if ckv is not None:
+        # Row 0's compacted valid slots (prefix of the row); read the actual
+        # fp8 cache bytes the kernel consumes for them.
+        slots = topk_slots[0].reshape(-1)[:24].long()
+        ck = ckv[slots].detach().float()
+        per_slot_finite = torch.isfinite(ck).all(dim=-1).flatten().cpu().tolist()
+        extras += (
+            f" | ckv finite={bool(torch.isfinite(ck).all().item())}"
+            f" absmax={float(ck.nan_to_num().abs().max().item()):.4f}"
+            f" slot_finite={per_slot_finite}"
+        )
     log.error(
         "GLM53_DECODE_DUMP call=%d buf=%s ntok=%d topk_idx[0:%d]=%s "
         "kv_slots[0:%d]=%s topk_valid=%s kv_valid=%s | out finite=%s mean=%.4f "
-        "std=%.4f absmax=%.4f first=%s",
+        "std=%.4f absmax=%.4f first=%s%s",
         _DECODE_DUMP_CALLS,
         buf_ptr,
         int(topk_indices.shape[0]),
@@ -117,6 +137,7 @@ def _maybe_dump_decode(
         float(o.std().item()),
         float(o.abs().max().item()),
         o.flatten()[:6].tolist(),
+        extras,
     )
 
 # The BatchMLAPagedAttentionWrapper keeps its plan/schedule state inside the
@@ -549,5 +570,12 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseMetadat
             else {}
         )
         out = state.wrapper.run(q_nope, q_pe, ckv, kpe, **scale_kwargs)
-        _maybe_dump_decode(topk_indices, topk_slots, out, self.topk_indices_buffer)
+        _maybe_dump_decode(
+            topk_indices,
+            topk_slots,
+            out,
+            self.topk_indices_buffer,
+            q_nope=q_nope,
+            ckv=ckv,
+        )
         return out, None
