@@ -640,9 +640,15 @@ class Glm5NextModel(nn.Module):
             buffer_width = (
                 (buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n
             ) * sparse_topk_block_n
-            topk_indices_buffer = torch.empty(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                buffer_width,
+            # Day-0 patch_v7: initialize to -1, not empty. The top-k kernels
+            # only guarantee the first min(k, valid) entries; rows with fewer
+            # valid pools otherwise carry uninitialized int32 pool ids ->
+            # in-range-but-bogus token indices -> MLA gathers uninitialized KV
+            # -> first-token-correct-then-degenerate output.
+            topk_indices_buffer = torch.full(
+                (vllm_config.scheduler_config.max_num_batched_tokens,
+                 buffer_width),
+                -1,
                 dtype=torch.int32,
                 device=self.device,
             )
