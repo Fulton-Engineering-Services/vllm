@@ -61,9 +61,11 @@ from vllm.model_executor.models.glm4_1v import (
     Glm4vForConditionalGeneration,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
+    SupportsEagle3,
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
@@ -617,7 +619,7 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
 
-class Glm5NextModel(nn.Module):
+class Glm5NextModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -733,10 +735,40 @@ class Glm5NextModel(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
 
-        for layer in self._active_layers:
+        # DFLASH2-AUX-CAPTURE (EAGLE-3 aux hidden states; mirrors
+        # DeepseekV4Model.forward in vllm/models/deepseek_v4/nvidia/model.py).
+        aux_hidden_states: list[torch.Tensor] = []
+        for idx, layer in enumerate(self._active_layers, start=self.start_layer):
             hidden_states, residual, post, comb = layer(
                 positions, hidden_states, residual, post, comb
             )
+            if idx + 1 in self.aux_hidden_state_layers:
+                # `idx + 1` matches deepseek_v4: the runner already converted
+                # DFlash target_layer_ids to id+1 semantics
+                # (gpu_model_runner._get_eagle3_aux_layers_from_config), so
+                # this captures the OUTPUT of 0-based decoder layer `idx`.
+                if post is not None:
+                    # Mid-stack mHC layer: its final hc_post is deferred to
+                    # the next layer's fused pre. Materialize the multi-stream
+                    # reconstruction here (pure op -- the deferred
+                    # residual/post/comb state is not mutated), then contract
+                    # hc streams exactly like the last layer does.
+                    # hc_contract == mean over streams, the same contraction
+                    # deepseek_v4 uses (aux_recon.mean(dim=1)).
+                    aux_recon = layer.hc_post(hidden_states, residual, post, comb)
+                    aux_hidden_state = hc_contract(aux_recon, layer.n)
+                else:
+                    # Last mHC layer (already hc_post + hc_contract'ed inside
+                    # the layer) or a non-mHC layer: the output is already
+                    # plain [num_tokens, hidden_size].
+                    aux_hidden_state = hidden_states
+                if self.is_sequence_parallel:
+                    # Aux states are consumed at full-sequence granularity;
+                    # gather the SP shard (deepseek_v4 pattern).
+                    aux_hidden_state = sp_all_gather(aux_hidden_state)[
+                        :full_num_tokens
+                    ]
+                aux_hidden_states.append(aux_hidden_state)
 
         if not get_pp_group().is_last_rank:
             # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
@@ -752,6 +784,11 @@ class Glm5NextModel(nn.Module):
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
         hidden_states = self.norm(hidden_states)
+        if len(aux_hidden_states) > 0:
+            # (final_hidden_states, list-of-aux) -- gpu_model_runner unpacks
+            # this tuple when use_aux_hidden_state_outputs is set; identical
+            # to DeepseekV4Model.forward's aux return.
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -916,7 +953,7 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForCausalLM(
-    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
+    nn.Module, HasInnerState, SupportsPP, SupportsEagle3, MixtureOfExperts, IsHybrid
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1012,7 +1049,7 @@ class Glm5NextForCausalLM(
     dummy_inputs=Glm4vDummyInputsBuilder,
 )
 class Glm5NextForConditionalGeneration(
-    Glm4vForConditionalGeneration, HasInnerState, IsHybrid
+    Glm4vForConditionalGeneration, HasInnerState, IsHybrid, SupportsEagle3
 ):
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
     # multimodal wrapper must declare the same interfaces so vLLM treats it as
