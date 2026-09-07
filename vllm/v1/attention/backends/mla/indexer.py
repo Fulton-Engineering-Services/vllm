@@ -1232,6 +1232,15 @@ class KpoolTailMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
 
     schedules_deepgemm_paged_mqa: ClassVar[bool] = False
 
+    def _prepare_decode_tensors(self, *args, block_table, **kwargs):
+        # The runner sizes the tail group's block table for the full context,
+        # but the tail manager allocates one manager block per request, so only
+        # the first buffer-width columns are ever populated. Spec-decode's
+        # variable decode lengths take a shape-checked torch copy that rejects
+        # the full-width table; truncate to the populated columns.
+        block_table = block_table[:, : self.expanded_block_table_buffer.shape[1]]
+        return super()._prepare_decode_tensors(*args, block_table=block_table, **kwargs)
+
 
 def build_prefill_chunk_metadata(
     start_idx: int,
