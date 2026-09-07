@@ -426,6 +426,40 @@ def test_heterogeneous_config_varying_nothing_vllm_reads():
     assert arch[2] is arch
 
 
+def test_glm5_next_text_is_recognized_as_deepseek_mla():
+    """Glm5NextTextConfig has MLA (11 of 45 layers) and kv_lora_rank."""
+    hf_config = PretrainedConfig(
+        model_type="glm5_next_text",
+        hidden_size=4096,
+        num_attention_heads=64,
+        num_key_value_heads=64,
+        kv_lora_rank=512,
+        qk_rope_head_dim=0,
+        num_hidden_layers=45,
+    )
+
+    convertor = ModelArchConfigConvertorBase(hf_config, hf_config)
+
+    assert convertor.is_deepseek_mla()
+    assert convertor.get_head_size() == 512
+
+
+def test_glm5_next_text_without_kv_lora_rank_is_not_mla():
+    """A Glm5NextTextConfig without kv_lora_rank is not MLA."""
+    hf_config = PretrainedConfig(
+        model_type="glm5_next_text",
+        hidden_size=4096,
+        num_attention_heads=64,
+        num_key_value_heads=64,
+        kv_lora_rank=None,
+        num_hidden_layers=45,
+    )
+
+    convertor = ModelArchConfigConvertorBase(hf_config, hf_config)
+
+    assert not convertor.is_deepseek_mla()
+
+
 @pytest.mark.parametrize("model", BASE_MODELS_TO_TEST)
 def test_base_model_arch_config(model: str):
     """Test model architecture config for base models."""
