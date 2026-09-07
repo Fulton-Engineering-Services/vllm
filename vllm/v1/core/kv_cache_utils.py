@@ -2191,15 +2191,21 @@ def get_kv_cache_configs(
         )
 
     # Check if the available memory is enough per worker.
-    for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
-        if not groups:
-            continue
-        _check_enough_kv_cache_memory(
-            avail_mem,
-            partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
-            vllm_config.model_config.max_model_len,
-            partial(_estimate_max_model_len_from_groups, vllm_config, groups),
-        )
+    # Skip this check when kv_cache_memory_bytes is explicitly set — the operator
+    # is overriding the profiler. The profiler overestimates for models with
+    # a mix of attention and linear-attention layers (e.g. GLM-5.3-Flash)
+    # because the hybrid block aligner inflates mamba page sizes to match
+    # the attention block size.
+    if vllm_config.cache_config.kv_cache_memory_bytes is None:
+        for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
+            if not groups:
+                continue
+            _check_enough_kv_cache_memory(
+                avail_mem,
+                partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
+                vllm_config.model_config.max_model_len,
+                partial(_estimate_max_model_len_from_groups, vllm_config, groups),
+            )
 
     kv_cache_configs: list[KVCacheConfig] = []
     for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
