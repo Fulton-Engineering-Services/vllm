@@ -1319,6 +1319,9 @@ class VllmConfig:
                 in (
                     "DeepseekV4ForCausalLM",
                     "DeepSeekV4MTPModel",
+                    "Glm5NextForCausalLM",
+                    "Glm5NextForConditionalGeneration",
+                    "Glm5NextMTPModel",
                     "InklingForCausalLM",
                     "InklingForConditionalGeneration",
                     "KimiK3ForConditionalGeneration",
