@@ -492,7 +492,10 @@ def test_kpool_tail_admission_bounded_working_set(glm5_lane):
     """
     from vllm.sampling_params import SamplingParams
     from vllm.v1.core.kv_cache_manager import KVCacheManager
-    from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
+    from vllm.v1.core.kv_cache_utils import (
+        generate_scheduler_kv_cache_config,
+        get_kv_cache_config_from_groups,
+    )
     from vllm.v1.core.single_type_kv_cache_manager import KpoolTailManager
     from vllm.v1.kv_cache_interface import KpoolTailSpec
     from vllm.v1.request import Request
