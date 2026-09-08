@@ -2397,14 +2397,9 @@ def _max_memory_usage_bytes_from_groups(
         if tail_names:
             # Tail: 1 block/req, drawn from the shared pool.
             blocks_needed += 1
-        if hidden_names:
-            # Eagle3 aux hidden-state layers: slot-share the MLA tensors (no
-            # added bytes) but each draws block-id demand like a full-attention
-            # layer. Use the attn group's per-request block count.
-            blocks_needed += len(hidden_names) * cdiv(
-                vllm_config.model_config.max_model_len,
-                attn_group.kv_cache_spec.block_size,
-            )
+        # Eagle3 aux hidden-state layers slot-share the MLA tensors AND read the
+        # same positions the MLA layer processes (they are aux capture taps, not
+        # independent attention), so they add neither bytes nor block-id demand.
         per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
         if draft_group is not None:
             # Charge the drafter's window-bounded block-id demand; a standalone
