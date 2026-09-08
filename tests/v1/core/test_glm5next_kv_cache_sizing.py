@@ -88,6 +88,9 @@ KDA_REC_SHAPE = (LINEAR_NUM_HEADS // TP_SIZE, LINEAR_HEAD_DIM, LINEAR_HEAD_DIM)
 # Observed on gx10-node1 boot (2026-09-05 09:27): "Available KV cache memory: 22.62 GiB"
 EXPECTED_AVAILABLE_GIB = 22.62
 
+# Live deployment pin (--kv-cache-memory 25769803776 = 24 GiB).
+KV_MEMORY_BYTES = 25769803776
+
 
 def _vllm_config() -> VllmConfig:
     # ModelConfig() with no model id skips HF loading (mirrors the pattern in
@@ -267,4 +270,154 @@ def test_check_enough_memory_does_not_raise(cfg_and_specs):
         partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
         MAX_MODEL_LEN,
         lambda _mem: 0,
+    )
+
+
+# --- GLM-5.3-Flash KV fast-path lane (slot-sharing, real pages) -------------
+#
+# Regression guard for the lane dropped in the v0.28.0 rebase and restored on
+# the glm5next-lane-restore branch. The generic hybrid path pads the kpool
+# indexer's 8.4 KiB page to the 1.125 MiB MLA page (138x); the lane keeps each
+# cache kind at its real page size via slot-sharing.
+
+
+def _build_glm5_specs(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
+    """Raw model-runner specs (no backend customize_spec promotion): the lane
+    sees KpoolTailSpec / SlidingWindowSpec / MLAAttentionSpec / MambaSpec."""
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    cache_config = vllm_config.cache_config
+    specs: dict[str, KVCacheSpec] = {}
+    for i in range(NUM_HIDDEN_LAYERS):
+        if i in FULL_ATTN_LAYERS:
+            specs[f"model.layers.{i}.self_attn"] = MLAAttentionSpec(
+                block_size=BLOCK_SIZE,
+                num_kv_heads=1,
+                head_size=KV_LORA_RANK,
+                dtype=KV_CACHE_DTYPE,
+                cache_dtype_str="fp8_e4m3",
+                head_size_v=0,
+            )
+            idx = Glm5NextIndexerCache(
+                head_dim=INDEX_HEAD_DIM + INDEX_HEAD_DIM // 128 * 4,
+                dtype=INDEXER_DTYPE,
+                prefix=f"model.layers.{i}.self_attn.indexer",
+                cache_config=cache_config,
+                index_kpool=INDEX_KPOOL,
+            )
+            specs[idx.prefix] = idx.get_kv_cache_spec(vllm_config)
+            tail = Glm5NextTailCache(
+                head_dim=INDEX_HEAD_DIM,
+                dtype=torch.bfloat16,
+                prefix=f"model.layers.{i}.self_attn.indexer.tail",
+                cache_config=cache_config,
+                index_kpool=INDEX_KPOOL,
+            )
+            specs[tail.prefix] = tail.get_kv_cache_spec(vllm_config)
+        else:
+            specs[f"model.layers.{i}.linear_attn"] = MambaSpec(
+                block_size=BLOCK_SIZE,
+                shapes=(KDA_CONV_SHAPE, KDA_REC_SHAPE),
+                dtypes=(torch.bfloat16, torch.float32),
+                mamba_type=MambaAttentionBackendEnum.MAMBA2,
+                mamba_cache_mode="align",
+            )
+    # DFlash2 drafter: 5 plain sliding-window attention layers.
+    for j in range(5):
+        specs[f"drafter.model.layers.{j}.self_attn"] = SlidingWindowSpec(
+            block_size=8,
+            num_kv_heads=2,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=2048,
+        )
+    return specs
+
+
+@pytest.fixture(scope="module")
+def glm5_lane():
+    from vllm.v1.core.kv_cache_utils import (
+        _get_kv_cache_groups_glm5_next,
+        _glm5_next_tensor_layout,
+    )
+
+    vllm_config = _vllm_config()
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    with set_current_vllm_config(vllm_config):
+        specs = _build_glm5_specs(vllm_config)
+        groups = _get_kv_cache_groups_glm5_next(vllm_config, specs)
+        layout = _glm5_next_tensor_layout(groups) if groups else None
+        yield vllm_config, specs, groups, layout
+
+
+def test_lane_grouping_structure(glm5_lane):
+    """The lane must produce MLA + indexer + tail + mamba + drafter groups."""
+    _, _, groups, layout = glm5_lane
+    assert groups is not None, "glm5 lane returned None"
+    assert layout is not None, "layout detection failed"
+    (
+        attn_group,
+        mamba_groups,
+        mla_names,
+        idx_names,
+        mla_page,
+        idx_page,
+        tail_names,
+        _tail_page,
+        draft_group,
+    ) = layout
+    assert len(mla_names) == 11 and len(idx_names) == 11
+    assert len(tail_names) == 11 and len(mamba_groups) == 4
+    assert draft_group is not None
+    # Indexer at its real small page, NOT padded to the MLA page.
+    assert idx_page < mla_page
+    assert idx_page == 8448
+
+
+def test_lane_indexer_not_padded(glm5_lane):
+    """The indexer's real page must survive (no 138x MLA-page padding)."""
+    _, specs, _, _ = glm5_lane
+    idx_spec = specs["model.layers.3.self_attn.indexer"]
+    assert idx_spec.page_size_bytes == 8448
+    assert idx_spec.page_size_padded is None
+
+
+def test_lane_tensor_emission_and_pool(glm5_lane):
+    """Tensor emission must slot-share mamba into MLA and tail into indexer,
+    and the pool must serve well over 1M tokens on the 24 GiB pin."""
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+
+    vllm_config, _, groups, layout = glm5_lane
+    assert layout is not None
+    cfg = get_kv_cache_config_from_groups(vllm_config, groups, KV_MEMORY_BYTES)
+    tokens = cfg.num_blocks * BLOCK_SIZE
+    print(f"\nlane: num_blocks={cfg.num_blocks} tokens={tokens} (live generic: 333K)")
+    assert tokens > 1_000_000, (
+        f"lane serves {tokens} tokens; must exceed the 1M max_model_len"
+    )
+    # Every indexer tensor is co-owned by its sibling tail layer.
+    idx_tensors = [t for t in cfg.kv_cache_tensors if "indexer" in t.shared_by[0]]
+    assert len(idx_tensors) == 11
+    for t in idx_tensors:
+        assert any("tail" in n for n in t.shared_by)
+    # Every MLA tensor is co-owned by a mamba layer (slot-sharing).
+    mla_tensors = [
+        t
+        for t in cfg.kv_cache_tensors
+        if t.shared_by and t.shared_by[0].endswith("self_attn")
+    ]
+    assert any(len(t.shared_by) > 1 for t in mla_tensors)
+
+
+def test_lane_admission_fits_pin(glm5_lane):
+    """One 1M-token request must fit the 24 GiB pin (day-0: ~1.12x headroom)."""
+    vllm_config, _, groups, layout = glm5_lane
+    assert layout is not None
+    needed = _max_memory_usage_bytes_from_groups(vllm_config, groups)
+    print(f"\nadmission demand: {needed / (1 << 30):.2f} GiB vs pin "
+          f"{KV_MEMORY_BYTES / (1 << 30):.1f} GiB = "
+          f"{KV_MEMORY_BYTES / needed:.2f}x")
+    assert needed < KV_MEMORY_BYTES, (
+        f"1M request needs {needed / (1 << 30):.2f} GiB > "
+        f"{KV_MEMORY_BYTES / (1 << 30):.1f} GiB pin"
     )
