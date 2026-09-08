@@ -28,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
+    KpoolTailSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -1290,7 +1291,20 @@ def _use_packed_kv_cache_config(
     enable_cross_layers = (
         str(extra_config.get("enable_cross_layers_blocks", "False")).lower() == "true"
     )
-    return is_dsv4 or (enable_cross_layers and len(kv_cache_groups) > 1)
+    if is_dsv4 or (enable_cross_layers and len(kv_cache_groups) > 1):
+        return True
+    # Fork opt-in (env VLLM_GLM5NEXT_PACKED_KV=1): packed slab for the
+    # GLM-5.3-Flash + DFlash2 hybrid. The generic per-group uniform-page path
+    # pads the kpool indexer's 8.4 KiB page to the 1.125 MiB MLA page (138x)
+    # and adds 36% padding layers, collapsing the 24 GiB pool to 333K tokens
+    # (0.32x of the 1M max_model_len). The packed slab keeps every layer at
+    # its real page size. Env-gated so no other model's layout changes.
+    if os.getenv("VLLM_GLM5NEXT_PACKED_KV", "0") != "1":
+        return False
+    archs = vllm_config.model_config.architectures or ()
+    spec_cfg = vllm_config.speculative_config
+    spec_method = spec_cfg.method if spec_cfg is not None else None
+    return any(a.startswith("Glm5Next") for a in archs) and spec_method == "dflash"
 
 
 def _get_kv_cache_config_packed(
@@ -1324,11 +1338,76 @@ def _get_kv_cache_config_packed(
     return num_blocks, kv_cache_tensors
 
 
-def get_kv_cache_config_from_groups(
+def _get_kv_cache_config_packed_hybrid(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
-) -> KVCacheConfig:
+) -> tuple[int, list[KVCacheTensor]]:
+    """Plan a packed slab for a hybrid (mamba + MLA + small bounded caches) model.
+
+    Each block of the shared slab packs one "manager block"'s worth of every
+    group's layers at their REAL per-layer page sizes. Groups keep their own
+    token-granularity via a per-group kernel-blocks-per-manager-block ratio:
+    the 2304-token attention groups use 1:1, the 256-token indexer uses 9:1
+    (2304/256, preserving its 64-token DeepGEMM pool tiles), the one-block
+    kpool tail and sliding-window drafter and mamba groups use a fixed 1
+    slot per manager block (their real per-request footprint). This avoids
+    the generic uniform-page allocation, which pads the indexer's 8.4 KiB
+    page to the 1.125 MiB MLA page (138x) and adds 36% padding layers.
+    """
+    manager_block_size = max(g.kv_cache_spec.block_size for g in kv_cache_groups)
+
+    # per-group: (kernel blocks per manager block, kernel page bytes per layer)
+    group_layout: list[tuple[int, int]] = []
+    layer_offset: dict[str, int] = {}
+    # (offset, blocks_per_manager_block) -> layer names, so groups with distinct
+    # kernel granularity get correctly-strided views of the shared slab.
+    packed: dict[tuple[int, int], list[str]] = defaultdict(list)
+    block_stride = 0
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        assert not isinstance(spec, UniformTypeKVCacheSpecs)
+        if isinstance(spec, MambaSpec):
+            # Mamba state is per-sequence, not per-token: one slot covers a
+            # request regardless of length (align mode holds a fixed small
+            # number of blocks per sequence).
+            blocks_per_mb = 1
+            layer_kernel_page = spec.page_size_bytes
+        elif spec.max_num_blocks_per_req(vllm_config, manager_block_size) == 1:
+            # Bounded one-block caches (kpool tail) and short-window drafter:
+            # a single kernel block covers the whole request.
+            blocks_per_mb = 1
+            layer_kernel_page = spec.page_size_bytes
+        else:
+            blocks_per_mb = manager_block_size // spec.block_size
+            layer_kernel_page = spec.page_size_bytes // blocks_per_mb
+            assert blocks_per_mb * layer_kernel_page == spec.page_size_bytes, (
+                f"Layer page {spec.page_size_bytes} does not divide evenly "
+                f"across {blocks_per_mb} kernel blocks"
+            )
+        for layer_name in group.layer_names:
+            layer_offset[layer_name] = block_stride
+            packed[(block_stride, blocks_per_mb)].append(layer_name)
+            block_stride += layer_kernel_page
+        group_layout.append((blocks_per_mb, layer_kernel_page))
+
+    num_blocks = available_memory // block_stride
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    total_size = block_stride * num_blocks
+
+    kv_cache_tensors: list[KVCacheTensor] = [
+        KVCacheTensor(
+            size=total_size,
+            shared_by=names,
+            offset=byte_offset,
+            block_stride=block_stride,
+        )
+        for (byte_offset, _bpmb), names in sorted(packed.items())
+    ]
+    return num_blocks, kv_cache_tensors
+
+
+
     """
     Generate the KV cache configuration from the KV cache groups and spec
     of each layer.
@@ -1369,11 +1448,20 @@ def get_kv_cache_config_from_groups(
             for layer_name in kv_cache_groups[0].layer_names
         ]
     elif _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
-        # DeepSeek V4 uses the packed layout by default. Other multi-group
-        # layouts can opt in with --enable-cross-layers.
-        num_blocks, kv_cache_tensors = _get_kv_cache_config_packed(
-            vllm_config, kv_cache_groups, available_memory
-        )
+        if all(
+            isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
+            for g in kv_cache_groups
+        ):
+            # DeepSeek V4 uses the packed layout by default.
+            num_blocks, kv_cache_tensors = _get_kv_cache_config_packed(
+                vllm_config, kv_cache_groups, available_memory
+            )
+        else:
+            # Fork opt-in (VLLM_GLM5NEXT_PACKED_KV): hybrid mamba + MLA +
+            # small bounded caches packed at their real page sizes.
+            num_blocks, kv_cache_tensors = _get_kv_cache_config_packed_hybrid(
+                vllm_config, kv_cache_groups, available_memory
+            )
     else:
         # General case:
         # We will have group_size memory pools, each is shared by one layer from
@@ -1742,6 +1830,66 @@ def _largest_divisor_at_most(value: int, limit: int) -> int:
     return 1
 
 
+def _get_kv_cache_groups_glm5_packed(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Group GLM-5.3-Flash (+ DFlash2 drafter) layers for the packed slab.
+
+    Returns None unless every layer is one of the known GLM-5.3-Flash cache
+    kinds, so a config drift (new layer type, renamed prefix) falls back to the
+    generic path instead of silently mis-grouping. Groups are formed WITHOUT
+    page unification: each group keeps its spec's real block_size and page so
+    the packed slab packs them densely. Layer-name patterns:
+
+      model.layers.N.self_attn              -> MLA (target full attention)
+      model.layers.N.self_attn.indexer      -> kpool indexer (fp8, compress)
+      model.layers.N.self_attn.indexer.tail -> kpool tail (1 block/req)
+      model.layers.N.linear_attn            -> KDA mamba (per-sequence state)
+      drafter.*.self_attn                   -> DFlash2 sliding-window drafter
+    """
+    mamba: list[str] = []
+    mla: list[str] = []
+    indexer: list[str] = []
+    tail: list[str] = []
+    drafter: list[str] = []
+    for name, spec in kv_cache_spec.items():
+        if isinstance(spec, MambaSpec):
+            mamba.append(name)
+        elif isinstance(spec, KpoolTailSpec):
+            tail.append(name)
+        elif isinstance(spec, MLAAttentionSpec) and spec.compress_ratio > 1:
+            indexer.append(name)
+        elif isinstance(spec, MLAAttentionSpec):
+            mla.append(name)
+        elif isinstance(spec, SlidingWindowSpec):
+            drafter.append(name)
+        else:
+            return None
+    if not (mamba and mla and indexer):
+        # Not a GLM-5.3-Flash layout; let the generic path handle it.
+        return None
+
+    groups: list[KVCacheGroupSpec] = []
+
+    def _add(names: list[str]) -> None:
+        if names:
+            names.sort(key=lambda n: (0 if n.startswith("model.") else 1, n))
+            merged = type(kv_cache_spec[names[0]]).merge(
+                [kv_cache_spec[n] for n in names]
+            )
+            groups.append(KVCacheGroupSpec(names, merged))
+
+    _add(mamba)
+    _add(mla)
+    _add(indexer)
+    _add(tail)
+    _add(drafter)
+    if drafter:
+        # The drafter is the eagle/draft group (separate KV lifecycle).
+        groups[-1].is_eagle_group = True
+    return groups
+
+
 def get_kv_cache_groups(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
 ) -> list[KVCacheGroupSpec]:
@@ -1768,7 +1916,16 @@ def get_kv_cache_groups(
         # most models. Allocate the same amount of memory for
         # each layer.
         return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
-    elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
+
+    # Fork opt-in: GLM-5.3-Flash + DFlash2 packed slab. Group by cache kind
+    # with NO page unification so each group keeps its real block size / page;
+    # the packed allocator packs them densely (see _use_packed_kv_cache_config).
+    if os.getenv("VLLM_GLM5NEXT_PACKED_KV", "0") == "1":
+        glm5_groups = _get_kv_cache_groups_glm5_packed(kv_cache_spec)
+        if glm5_groups is not None:
+            return glm5_groups
+
+    if uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
         # All layers need the same number of token slots (e.g., all layers are
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
@@ -1930,6 +2087,18 @@ def _max_memory_usage_bytes_from_groups(
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
+    if _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
+        # Packed slab: demand = block_stride (bytes per manager block, all
+        # layers at real page sizes) x the manager blocks a max-length request
+        # needs (driven by the largest block_size group). Bounded caches
+        # (kpool tail, drafter window, mamba state) add a fixed per-request
+        # term, not a per-token one.
+        block_stride, _ = _get_packed_kv_cache_layout(kv_cache_groups)
+        manager_block_size = max(g.kv_cache_spec.block_size for g in kv_cache_groups)
+        max_len = vllm_config.model_config.max_model_len
+        manager_blocks = cdiv(max_len, manager_block_size)
+        return block_stride * manager_blocks
+
     group_size = max(len(group.layer_names) for group in kv_cache_groups)
     page_size = get_uniform_page_size(
         [group.kv_cache_spec for group in kv_cache_groups]
