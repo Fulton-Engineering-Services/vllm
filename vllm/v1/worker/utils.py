@@ -146,7 +146,17 @@ class KVBlockZeroer:
                 continue
             kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
             assert spec.block_size % kernel_bs == 0
-            ratio = spec.block_size // kernel_bs
+            # A compressed spec (storage_block_size != block_size, e.g. the
+            # GLM-5.3 kpool indexer) allocates and zeroes its cache at the
+            # whole-scheduler-block granularity: the manager/kernel virtual
+            # split (ratio) subdivides the block for the *kernel* read path,
+            # but the physical zeroing unit is the full compressed block.
+            # Zeroing whole blocks is correct here, so use ratio = 1.
+            is_compressed = (
+                getattr(spec, "storage_block_size", spec.block_size)
+                != spec.block_size
+            )
+            ratio = 1 if is_compressed else spec.block_size // kernel_bs
             block_dim = group.backend.get_kv_cache_block_dim(
                 kernel_bs,
                 spec.num_kv_heads,
