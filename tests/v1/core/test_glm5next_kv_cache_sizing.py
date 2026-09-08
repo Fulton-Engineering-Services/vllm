@@ -212,14 +212,14 @@ def test_indexer_spec_block_size_preserved(cfg_and_specs):
         f"storage_block_size={idx_spec.storage_block_size} "
         f"page={idx_spec.page_size_bytes}"
     )
-    # The spec block is pinned to kernel_block(64) * kpool so the runtime's
-    # kernel-block split yields a DeepGEMM-legal block_kv=64 (block_size=2304
-    # crashed the paged-MQA assert with block_kv=16).
-    assert idx_spec.block_size == 64 * INDEX_KPOOL
+    # The indexer presents the model-wide scheduler block (2304) to the KV
+    # manager so its pool accounting is uniform with the co-located MLA;
+    # storage_block_size stays at the DeepGEMM tile (64) via compress_ratio =
+    # block_size // 64 (36). The kpool compression rides tokens_per_state (4).
+    assert idx_spec.block_size == BLOCK_SIZE
     assert idx_spec.storage_block_size == 64
-    # The kpool compression must be expressed as compress_ratio (day-0
-    # semantics), which is what actually shrinks storage_block_size.
-    assert idx_spec.compress_ratio == INDEX_KPOOL
+    assert idx_spec.tokens_per_state == INDEX_KPOOL
+    assert idx_spec.compress_ratio == BLOCK_SIZE // 64
 
 
 def test_needed_memory_fits_reference_budget(cfg_and_specs):
@@ -371,11 +371,10 @@ def test_lane_grouping_structure(glm5_lane):
     assert len(tail_names) == 11 and len(mamba_groups) == 4
     assert draft_group is not None
     assert hidden_names == []  # no Eagle3 aux layers in this spec set
-    # The layout's idx_page is the per-SCHEDULER-block indexer page: the real
-    # 8.4 KiB indexer page (256-token block) scaled by mla_block/idx_block
-    # (2304/256 = 9), so the indexer spans the full 2304-token scheduler block
-    # instead of capping at 1971*256 = 504K tokens. NOT padded to the MLA page.
-    assert idx_page == 8448 * 9
+    # The indexer is uniform with the MLA at block_size=2304 (storage 64 via
+    # compress_ratio=36), so the layout's idx_page is its real 8.4 KiB page with
+    # NO padding to the MLA page and no 9x scaling (idx_block == mla_block now).
+    assert idx_page == 8448
     assert idx_page < mla_page
 
 
