@@ -132,7 +132,7 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         )
 
     def get_attn_backend(self):
-        from vllm.v1.attention.backends.mla.indexer import (
+        from vllm.v1.attention.backends.mla.glm5next_indexer import (
             Glm5NextKpoolIndexerBackend,
         )
 
@@ -176,7 +176,7 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
         return build_tail_spec(head_dim=self.head_dim, index_kpool=self._index_kpool)
 
     def get_attn_backend(self):
-        from vllm.v1.attention.backends.mla.indexer import KpoolTailBackend
+        from vllm.v1.attention.backends.mla.glm5next_indexer import KpoolTailBackend
 
         return KpoolTailBackend
 

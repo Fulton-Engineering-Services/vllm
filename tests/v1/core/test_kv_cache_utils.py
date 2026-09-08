@@ -3158,7 +3158,7 @@ def test_glm5_next_kpool_tail_kernel_block_size_is_pool_size():
     (blocks_per_kv_block = 3072/4 = 768), matching the kernels'
     pool-granular slot arithmetic (block * kpool + pos % kpool).
     """
-    from vllm.v1.attention.backends.mla.indexer import KpoolTailBackend
+    from vllm.v1.attention.backends.mla.glm5next_indexer import KpoolTailBackend
     from vllm.v1.worker.utils import select_common_block_size
 
     # Any multiple of 4 the manager block could be must resolve to 4.
@@ -3189,10 +3189,12 @@ def test_glm5_next_kpool_tail_builder_never_schedules_deepgemm():
     scheduler while keeping the DeepseekV32IndexerMetadata shape the kpool
     op asserts on.
     """
-    from vllm.v1.attention.backends.mla.indexer import (
-        DeepseekV32IndexerMetadataBuilder,
+    from vllm.v1.attention.backends.mla.glm5next_indexer import (
         KpoolTailBackend,
         KpoolTailMetadataBuilder,
+    )
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepseekV32IndexerMetadataBuilder,
     )
 
     builder_cls = KpoolTailBackend.get_builder_cls()

@@ -44,7 +44,7 @@ from vllm.config import (
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90 import (
     FlashInferMLASparseSM90Backend,
 )
-from vllm.v1.attention.backends.mla.indexer import (
+from vllm.v1.attention.backends.mla.glm5next_indexer import (
     Glm5NextKpoolIndexerBackend,
     KpoolTailBackend,
 )
