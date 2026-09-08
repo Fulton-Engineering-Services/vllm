@@ -7575,7 +7575,18 @@ class GPUModelRunner(
 
                     # For MLA with compression, storage_block_size != block_size
                     if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-                        shape_block_size = kv_cache_spec.storage_block_size
+                        # Compressed spec (e.g. the GLM-5.3 kpool indexer): the
+                        # physical page is the pooled size of ONE kernel block,
+                        # kernel_block_size // compress_ratio (256//4 = 64), NOT
+                        # block_size // compress_ratio (the whole scheduler
+                        # block's pooled span, 2304//4 = 576). When there is no
+                        # kernel split (block_size == kernel_block_size) these
+                        # coincide; under a hybrid split they differ and only
+                        # the per-kernel-block page is DeepGEMM-legal
+                        # (block_kv in {32, 64}).
+                        shape_block_size = (
+                            kernel_block_size // kv_cache_spec.compress_ratio
+                        )
                     else:
                         shape_block_size = kernel_block_size
 

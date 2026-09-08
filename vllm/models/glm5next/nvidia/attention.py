@@ -125,15 +125,12 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
 
         spec = super().get_kv_cache_spec(vllm_config)
         # Present the model-wide scheduler block (2304) to the KV manager so
-        # the indexer's pool accounting is uniform with the co-located MLA;
-        # pinning block_size to kernel_tile*kpool (256) made the manager
-        # allocate cdiv(tokens,256) blocks from the 2304-token pool, stalling
-        # admission on long requests. compress_ratio stays = index_kpool so the
-        # kpool compression (tokens_per_state) and the DeepGEMM block_kv are
-        # both derived correctly downstream: the runtime hybrid block-table
-        # splits each 2304 manager block into 256-token kernel blocks, and the
-        # metadata builder reads the kernel block (256) -> storage_block_size
-        # = 256 // index_kpool = 64 (DeepGEMM-legal).
+        # the indexer's pool accounting is uniform with the co-located MLA.
+        # compress_ratio = index_kpool is the kpool pooling ratio (4 tokens ->
+        # 1 state); it is load-bearing for the pooling math downstream
+        # (seq_lens // compress_ratio), NOT merely page sizing. The physical
+        # DeepGEMM page (64 states) is derived at the worker from the kernel
+        # block split, not from block_size // compress_ratio.
         assert isinstance(spec, MLAAttentionSpec)
         spec = replace(
             spec,

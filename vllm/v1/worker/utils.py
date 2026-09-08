@@ -146,17 +146,7 @@ class KVBlockZeroer:
                 continue
             kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
             assert spec.block_size % kernel_bs == 0
-            # A compressed spec (storage_block_size != block_size, e.g. the
-            # GLM-5.3 kpool indexer) allocates and zeroes its cache at the
-            # whole-scheduler-block granularity: the manager/kernel virtual
-            # split (ratio) subdivides the block for the *kernel* read path,
-            # but the physical zeroing unit is the full compressed block.
-            # Zeroing whole blocks is correct here, so use ratio = 1.
-            is_compressed = (
-                getattr(spec, "storage_block_size", spec.block_size)
-                != spec.block_size
-            )
-            ratio = 1 if is_compressed else spec.block_size // kernel_bs
+            ratio = spec.block_size // kernel_bs
             block_dim = group.backend.get_kv_cache_block_dim(
                 kernel_bs,
                 spec.num_kv_heads,
@@ -178,14 +168,7 @@ class KVBlockZeroer:
                 el = kv.element_size()
                 block_stride_bytes = kv.stride(block_dim) * el
                 assert block_stride_bytes % 4 == 0
-                if kv.shape[block_dim] % ratio != 0:
-                    raise AssertionError(
-                        f"KVBlockZeroer: layer={layer_name} group={group.kv_cache_group_id} "
-                        f"spec={type(spec).__name__} spec.block_size={spec.block_size} "
-                        f"kernel_bs={kernel_bs} ratio={ratio} "
-                        f"kv.shape={tuple(kv.shape)} block_dim={block_dim} "
-                        f"kv.shape[block_dim]={kv.shape[block_dim]}"
-                    )
+                assert kv.shape[block_dim] % ratio == 0
                 outer_dims = [
                     d
                     for d in range(block_dim)

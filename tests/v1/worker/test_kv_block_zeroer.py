@@ -314,16 +314,19 @@ def test_warmup_respects_available_block_count():
     assert torch.all(storage == 1)
 
 
-def test_compressed_indexer_zeroes_whole_blocks():
+def test_compressed_indexer_kernel_block_split_geometry():
     """Regression for the GLM-5.3-Flash kpool indexer boot crash.
 
     The indexer spec presents the model-wide scheduler block (2304) to the KV
-    manager with compress_ratio=4, so storage_block_size=576 != block_size. The
-    tensor is allocated per scheduler block: (num_sched_blocks, 576, head). The
-    manager/kernel split (ratio = block_size // kernel_bs = 2304 // 256 = 9) is
-    a *kernel-read* concern; the physical zeroing unit is the whole compressed
-    block. Before the fix, the zeroer asserted kv.shape[0] % 9 == 0 and crashed
-    because num_sched_blocks (1865) is not a multiple of 9.
+    manager (compress_ratio=4, the kpool pooling ratio). The worker splits each
+    scheduler block into kernel_block_size=256-token blocks for DeepGEMM, so the
+    physical page is kernel_block_size // compress_ratio = 64 states and the
+    tensor is (kernel_num_blocks, 64, head) with kernel_num_blocks =
+    num_sched_blocks * 9. The zeroer must treat each scheduler block as ratio=9
+    kernel sub-blocks. The pre-fix tensor shape (1865, 576, 132) -- built from
+    the manager block's pooled span 576 instead of the kernel page 64 -- made
+    kv.shape[0]=1865 fail the zeroer's % ratio==0 assert AND produced a
+    DeepGEMM-illegal block_kv=576 in the decode logits kernel.
     """
     device = torch.device("cpu")
     spec = MLAAttentionSpec(
@@ -334,10 +337,12 @@ def test_compressed_indexer_zeroes_whole_blocks():
         cache_dtype_str="fp8_e4m3",
         compress_ratio=4,
     )
-    assert spec.storage_block_size == 576  # compressed: != block_size
+    assert spec.storage_block_size == 576  # manager block's pooled span
     num_sched_blocks = 1865
+    kernel_num_blocks = num_sched_blocks * 9  # after the 256-token kernel split
+    # Physical page = kernel_block_size // compress_ratio = 256 // 4 = 64.
     storage = torch.ones(
-        (num_sched_blocks, 576, 132), dtype=torch.uint8, device=device
+        (kernel_num_blocks, 64, 132), dtype=torch.uint8, device=device
     )
     layer_name = "model.layers.3.self_attn.indexer.k_cache"
 
@@ -346,17 +351,19 @@ def test_compressed_indexer_zeroes_whole_blocks():
         attn_groups_iter=[
             AttentionGroup(_BlockFirstBackend, [layer_name], spec, 0)  # type: ignore[arg-type]
         ],
-        kernel_block_sizes=[256],  # would give ratio=9 without the fix
+        kernel_block_sizes=[256],
         cache_dtype="fp8",
         static_forward_context={layer_name: SimpleNamespace(kv_cache=storage)},
     )
 
-    # The whole-block unit: one segment per scheduler block, full 76032-byte
-    # page each, with the logical block stride equal to the physical block span.
-    # (Segment strides/pages are recorded in 4-byte words for the int32 kernel.)
+    # ratio = 2304 // 256 = 9 kernel sub-blocks per scheduler block. The zeroer
+    # emits ratio segments stepping by the kernel-block span (8448 B), with the
+    # logical (scheduler) block stride 8448*9 = 76032 B, each segment zeroing
+    # one 64-state kernel page (8448 B). Values are in 4-byte words.
     assert zeroer._meta is not None
     seg_addrs, seg_block_strides, seg_page_sizes, _, _, n_segs = zeroer._meta
-    assert n_segs == 1
-    assert seg_addrs.tolist() == [storage.data_ptr()]
-    assert seg_block_strides.tolist() == [76032 // 4]
-    assert seg_page_sizes.tolist() == [76032 // 4]
+    assert n_segs == 9
+    base = storage.data_ptr()
+    assert seg_addrs.tolist() == [base + v * 8448 for v in range(9)]
+    assert seg_block_strides.tolist() == [76032 // 4] * 9
+    assert seg_page_sizes.tolist() == [8448 // 4] * 9
