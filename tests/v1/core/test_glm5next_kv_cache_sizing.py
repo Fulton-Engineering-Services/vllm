@@ -23,9 +23,11 @@ Run inside the deployment image:
         -m pytest tests/v1/core/test_glm5next_kv_cache_sizing.py -v -s
 """
 
+from dataclasses import replace
+from math import gcd, lcm
+
 import pytest
 import torch
-from math import gcd, lcm
 
 from vllm.config import (
     CacheConfig,
@@ -41,8 +43,6 @@ from vllm.models.glm5next.nvidia.attention import (
     Glm5NextIndexerCache,
     Glm5NextTailCache,
 )
-from dataclasses import replace
-
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90 import (
     FlashInferMLASparseSM90Backend,
 )
@@ -342,9 +342,11 @@ def _build_glm5_specs(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
 
 @pytest.fixture(scope="module")
 def glm5_lane():
-    from vllm.v1.core.kv_cache_utils import (
-        _get_kv_cache_groups_glm5_next,
-        _glm5_next_tensor_layout,
+    from vllm.v1.glm5next.kv_groups import (
+        try_build_kv_cache_groups as _get_kv_cache_groups_glm5_next,
+    )
+    from vllm.v1.glm5next.tensor_layout import (
+        detect_layout as _glm5_next_tensor_layout,
     )
 
     vllm_config = _vllm_config()
@@ -439,10 +441,12 @@ def test_lane_survives_eagle3_hidden_layers():
     made the gate return None, and the live boot dropped to the generic path
     (448K tokens, mamba page padding 0.70%). The lane must exclude them from
     attn_specs, slot-share them into the MLA tensors, and still serve 1M."""
-    from vllm.v1.core.kv_cache_utils import (
-        _get_kv_cache_groups_glm5_next,
-        _glm5_next_tensor_layout,
-        get_kv_cache_config_from_groups,
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+    from vllm.v1.glm5next.kv_groups import (
+        try_build_kv_cache_groups as _get_kv_cache_groups_glm5_next,
+    )
+    from vllm.v1.glm5next.tensor_layout import (
+        detect_layout as _glm5_next_tensor_layout,
     )
     from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
 

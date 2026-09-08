@@ -963,26 +963,16 @@ def _pool_bytes_per_block(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         return kv_cache_groups[0].kv_cache_spec.page_size_bytes
-    if (glm5 := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+    from vllm.v1.glm5next.tensor_layout import detect_layout
+
+    if (glm5 := detect_layout(kv_cache_groups)) is not None:
         # GLM-5.3-Flash hybrid slot sharing: mamba layers co-own the MLA slot
         # tensors, and tail layers co-own the indexer slot tensors, so a block
         # costs one MLA page per MLA slot plus one indexer page per indexer
         # slot. An exact-fit drafter and the Eagle3 hidden-state layers ride
         # the MLA tensors (no added bytes); a standalone drafter adds one page
         # per drafter layer.
-        _, _, mla_names, idx_names, mla_page, idx_page, _, _, draft_group, _ = glm5
-        per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
-        if draft_group is not None:
-            draft_page = next(
-                iter(
-                    cast(
-                        UniformTypeKVCacheSpecs, draft_group.kv_cache_spec
-                    ).kv_cache_specs.values()
-                )
-            ).page_size_bytes
-            if draft_page != mla_page:
-                per_block += len(draft_group.layer_names) * draft_page
-        return per_block
+        return glm5.per_block_bytes
     if _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
         block_stride, _ = _get_packed_kv_cache_layout(kv_cache_groups)
         return block_stride
@@ -1122,162 +1112,6 @@ def unify_kv_cache_spec_page_size(
 def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
     # kv_cache_spec is an empty dict for attention free models
     return not kv_cache_spec
-
-
-def _glm5_next_tensor_layout(
-    kv_cache_groups: list[KVCacheGroupSpec],
-) -> (
-    tuple[
-        KVCacheGroupSpec,
-        list[KVCacheGroupSpec],
-        list[str],
-        list[str],
-        int,
-        int,
-        list[str],
-        int,
-        KVCacheGroupSpec | None,
-        list[str],
-    ]
-    | None
-):
-    """Detect the `vllm.v1.glm5next.kv_groups.try_build_kv_cache_groups`
-    layout from the
-    (possibly PP-projected) groups, so tensor emission and the accounting
-    paths can never disagree.
-
-    Returns:
-      - (attn_group, mamba_groups, mla_names, idx_names, mla_page, idx_page,
-         tail_names, tail_page, draft_group, hidden_names)
-      - None if the group config is invalid
-    """
-    uniform_groups = [
-        g
-        for g in kv_cache_groups
-        if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
-    ]
-    mamba_groups = [
-        g for g in kv_cache_groups if isinstance(g.kv_cache_spec, MambaSpec)
-    ]
-    # The MLA target group, the kpool indexer group, the kpool tail group, and
-    # the drafter group are all UniformTypeKVCacheSpecs; distinguish by the
-    # inner spec type and (for MLA) the compress_ratio.
-    attn_group: KVCacheGroupSpec | None = None
-    idx_group: KVCacheGroupSpec | None = None
-    tail_group: KVCacheGroupSpec | None = None
-    draft_group: KVCacheGroupSpec | None = None
-    for g in uniform_groups:
-        group_inner = cast(UniformTypeKVCacheSpecs, g.kv_cache_spec).kv_cache_specs
-        if all(type(s) is MLAAttentionSpec for s in group_inner.values()):
-            if all(s.compress_ratio == 1 for s in group_inner.values()):
-                attn_group = g
-            elif all(s.compress_ratio > 1 for s in group_inner.values()):
-                idx_group = g
-            else:
-                return None
-        elif all(isinstance(s, KpoolTailSpec) for s in group_inner.values()):
-            tail_group = g
-        elif group_inner and all(
-            type(s) is SlidingWindowSpec for s in group_inner.values()
-        ):
-            draft_group = g
-    if attn_group is None or idx_group is None or not mamba_groups:
-        return None
-    # HiddenStateCacheSpec groups (Eagle3 aux) are neither uniform-type nor
-    # mamba; exclude them from the group-count check.
-    non_hidden_groups = [
-        g
-        for g in kv_cache_groups
-        if not isinstance(g.kv_cache_spec, HiddenStateCacheSpec)
-    ]
-    if len(uniform_groups) + len(mamba_groups) != len(non_hidden_groups):
-        return None
-    attn_uniform = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
-    if not all(
-        type(s) is MLAAttentionSpec and s.page_size_padded is None
-        for s in attn_uniform.kv_cache_specs.values()
-    ):
-        return None
-    inner = cast(dict[str, MLAAttentionSpec], attn_uniform.kv_cache_specs)
-    idx_inner = cast(
-        dict[str, MLAAttentionSpec],
-        cast(UniformTypeKVCacheSpecs, idx_group.kv_cache_spec).kv_cache_specs,
-    )
-    mla_names = list(attn_group.layer_names)
-    idx_names = list(idx_group.layer_names)
-    mla_pages = {inner[n].page_size_bytes for n in mla_names}
-    idx_pages = {idx_inner[n].page_size_bytes for n in idx_names}
-    if len(mla_pages) != 1 or len(idx_pages) != 1:
-        return None
-    mla_page = mla_pages.pop()
-    if any(g.kv_cache_spec.page_size_bytes != mla_page for g in mamba_groups):
-        return None
-    if draft_group is not None:
-        # The drafter must have one uniform page and never be page_size_padded.
-        draft_inner = cast(
-            UniformTypeKVCacheSpecs, draft_group.kv_cache_spec
-        ).kv_cache_specs
-        draft_pages = {s.page_size_bytes for s in draft_inner.values()}
-        if len(draft_pages) != 1:
-            return None
-        if any(s.page_size_padded is not None for s in draft_inner.values()):
-            return None
-        if (
-            draft_pages.pop() == mla_page
-            and len(draft_group.layer_names) > len(mla_names)
-        ):
-            return None
-    tail_names: list[str] = []
-    tail_page = 0
-    if tail_group is not None:
-        tail_names = list(tail_group.layer_names)
-        # The tail spec is padded to idx_page (co-owns the indexer tensor), so
-        # page_size_bytes returns idx_page. Callers need the *logical* tail page
-        # (2048 B) for transfer sizing and accounting; use unpadded.
-        tail_pages = {
-            cast(KpoolTailSpec, s).unpadded_page_size_bytes
-            for s in cast(
-                UniformTypeKVCacheSpecs, tail_group.kv_cache_spec
-            ).kv_cache_specs.values()
-        }
-        if len(tail_pages) != 1:
-            return None
-        tail_page = tail_pages.pop()
-    # Eagle3 aux hidden-state layers (padded to mla_page) slot-share the first
-    # len(hidden) MLA tensors exactly like the mamba layers do.
-    hidden_names = [
-        name
-        for g in kv_cache_groups
-        if isinstance(g.kv_cache_spec, HiddenStateCacheSpec)
-        for name in g.layer_names
-    ]
-    # The kpool indexer runs at a finer block_size than the MLA/scheduler
-    # block, so each indexer layer needs (mla_block / idx_block) real pages per
-    # scheduler block. Surface the scaled per-scheduler-block indexer page so
-    # tensor emission and accounting never under-allocate it (the generic path
-    # hides this by unifying block sizes; the lane keeps them real).
-    idx_page = idx_pages.pop()
-    idx_block_size = cast(
-        UniformTypeKVCacheSpecs, idx_group.kv_cache_spec
-    ).block_size
-    mla_block_size = cast(
-        UniformTypeKVCacheSpecs, attn_group.kv_cache_spec
-    ).block_size
-    if mla_block_size % idx_block_size != 0:
-        return None
-    idx_page_per_sched = idx_page * (mla_block_size // idx_block_size)
-    return (
-        attn_group,
-        mamba_groups,
-        mla_names,
-        idx_names,
-        mla_page,
-        idx_page_per_sched,
-        tail_names,
-        tail_page,
-        draft_group,
-        hidden_names,
-    )
 
 
 def _get_kv_cache_groups_uniform_page_size(
@@ -1545,74 +1379,24 @@ def get_kv_cache_config_from_groups(
             )
             for layer_name in kv_cache_groups[0].layer_names
         ]
-    elif (glm5n := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=kv_cache_groups,
+        )
+
+    from vllm.v1.glm5next.tensor_layout import build_kv_cache_config, detect_layout
+
+    if (glm5n := detect_layout(kv_cache_groups)) is not None:
         # GLM-5.3-Flash hybrid slot sharing: one tensor per MLA layer, co-owned
         # by that MLA layer and one mamba layer from each mamba group; kpool
         # indexer layers get per-layer tensors that are ALSO co-owned by their
         # sibling tail layer. An exact-fit drafter layer co-owns its MLA tensor;
         # a standalone drafter gets compact per-layer tensors. Must precede the
         # packed layout, which would break the MLA contiguous virtual split.
-        (
-            _,
-            mamba_groups,
-            mla_names,
-            idx_names,
-            mla_page,
-            idx_page,
-            tail_names,
-            _tail_page,
-            draft_group,
-            hidden_names,
-        ) = glm5n
-        draft_names: list[str] = []
-        draft_page = 0
-        draft_shared = False
-        if draft_group is not None:
-            draft_names = list(draft_group.layer_names)
-            draft_page = next(
-                iter(
-                    cast(
-                        UniformTypeKVCacheSpecs, draft_group.kv_cache_spec
-                    ).kv_cache_specs.values()
-                )
-            ).page_size_bytes
-            draft_shared = draft_page == mla_page
-        if tail_names:
-            assert len(idx_names) == len(tail_names), (
-                "indexer/tail layer count mismatch: cannot pair for slot-sharing"
-            )
-        per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
-        if draft_names and not draft_shared:
-            # Standalone drafter tensors are part of every block's byte cost.
-            per_block += len(draft_names) * draft_page
-        num_blocks = available_memory // per_block
-        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
-        kv_cache_tensors = [
-            KVCacheTensor(
-                size=mla_page * num_blocks,
-                shared_by=[mla_name]
-                + [g.layer_names[i] for g in mamba_groups if i < len(g.layer_names)]
-                + ([draft_names[i]] if draft_shared and i < len(draft_names) else [])
-                + ([hidden_names[i]] if i < len(hidden_names) else []),
-            )
-            for i, mla_name in enumerate(mla_names)
-        ] + [
-            # Each indexer tensor is co-owned by its sibling tail layer (paired
-            # by model-layer order). idx_page here is the per-scheduler-block
-            # indexer page (already scaled by mla_block/idx_block in the layout),
-            # so the tensor spans the full 2304-token scheduler block.
-            KVCacheTensor(
-                size=idx_page * num_blocks,
-                shared_by=(
-                    [idx_names[i], tail_names[i]] if tail_names else [idx_names[i]]
-                ),
-            )
-            for i in range(len(idx_names))
-        ] + [
-            # Standalone drafter: compact per-layer tensors.
-            KVCacheTensor(size=draft_page * num_blocks, shared_by=[name])
-            for name in ([] if draft_shared else draft_names)
-        ]
+        num_blocks, kv_cache_tensors = build_kv_cache_config(
+            glm5n, vllm_config, available_memory
+        )
     elif _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
         # DeepSeek V4 uses the packed layout by default. Other multi-group
         # layouts can opt in with --enable-cross-layers.
@@ -2184,50 +1968,14 @@ def _max_memory_usage_bytes_from_groups(
             total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
         return total_max_mem_usage_bytes
 
-    elif (glm5n := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+    from vllm.v1.glm5next.tensor_layout import detect_layout, max_memory_usage_bytes
+
+    if (glm5n := detect_layout(kv_cache_groups)) is not None:
         # GLM-5.3-Flash hybrid slot sharing: every block id — attention-,
         # mamba-, tail-, or drafter-owned — is charged the full per-block byte
         # sum. The tail co-owns the indexer tensor (1 block/req), so it adds to
         # the shared block-id demand like mamba, not as a separate tensor.
-        (
-            attn_group,
-            mamba_groups,
-            mla_names,
-            idx_names,
-            mla_page,
-            idx_page,
-            tail_names,
-            _tail_page,
-            draft_group,
-            hidden_names,
-        ) = glm5n
-        uniform_spec = attn_group.kv_cache_spec
-        assert isinstance(uniform_spec, UniformTypeKVCacheSpecs)
-        blocks_needed = uniform_spec.max_memory_usage_pages(vllm_config)
-        for group in mamba_groups:
-            spec = group.kv_cache_spec
-            blocks_needed += cdiv(
-                spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
-            )
-        if tail_names:
-            # Tail: 1 block/req, drawn from the shared pool.
-            blocks_needed += 1
-        # Eagle3 aux hidden-state layers slot-share the MLA tensors AND read the
-        # same positions the MLA layer processes (they are aux capture taps, not
-        # independent attention), so they add neither bytes nor block-id demand.
-        per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
-        if draft_group is not None:
-            # Charge the drafter's window-bounded block-id demand; a standalone
-            # drafter also adds its pages to every block's byte cost.
-            draft_uniform = draft_group.kv_cache_spec
-            assert isinstance(draft_uniform, UniformTypeKVCacheSpecs)
-            blocks_needed += draft_uniform.max_memory_usage_pages(vllm_config)
-            draft_page = next(
-                iter(draft_uniform.kv_cache_specs.values())
-            ).page_size_bytes
-            if draft_page != mla_page:
-                per_block += len(draft_group.layer_names) * draft_page
-        return blocks_needed * per_block
+        return max_memory_usage_bytes(glm5n, vllm_config)
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
