@@ -172,8 +172,10 @@ class KVBlockZeroer:
                     raise AssertionError(
                         f"KVBlockZeroer: layer={layer_name} "
                         f"group={group.kv_cache_group_id} "
-                        f"spec={type(spec).__name__} spec.block_size={spec.block_size} "
-                        f"storage_block_size={getattr(spec, 'storage_block_size', '-')} "
+                        f"spec={type(spec).__name__} "
+                        f"spec.block_size={spec.block_size} "
+                        f"storage_block_size="
+                        f"{getattr(spec, 'storage_block_size', '-')} "
                         f"kernel_bs={kernel_bs} ratio={ratio} "
                         f"kv.shape={tuple(kv.shape)} kv.stride={tuple(kv.stride())} "
                         f"block_dim={block_dim} "
