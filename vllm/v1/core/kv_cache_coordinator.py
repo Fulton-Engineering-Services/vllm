@@ -193,11 +193,14 @@ class KVCacheCoordinator(ABC):
             The number of blocks to allocate.
         """
         num_blocks_to_allocate = 0
+        per_group: list[int] | None = None
+        if envs.GLM5_ALLOC_DEBUG:
+            per_group = []
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                d = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -207,7 +210,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                d = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],
@@ -216,6 +219,25 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                 )
+            num_blocks_to_allocate += d
+            if per_group is not None:
+                per_group.append(d)
+        if per_group is not None:
+            specs = self.kv_cache_config.kv_cache_groups
+            logger.warning(
+                "GLM5 ALLOC req=%s num_tokens=%d computed=%d cap=%s "
+                "per-group=%s total=%d free=%d",
+                request_id,
+                num_tokens,
+                total_computed_tokens,
+                apply_admission_cap,
+                [
+                    (i, type(g.kv_cache_spec).__name__, g.kv_cache_spec.block_size, d)
+                    for (i, g), d in zip(enumerate(specs), per_group)
+                ],
+                num_blocks_to_allocate,
+                self.block_pool.get_num_free_blocks(),
+            )
         return num_blocks_to_allocate
 
     def allocate_new_computed_blocks(
