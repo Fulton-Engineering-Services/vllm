@@ -371,9 +371,12 @@ def test_lane_grouping_structure(glm5_lane):
     assert len(tail_names) == 11 and len(mamba_groups) == 4
     assert draft_group is not None
     assert hidden_names == []  # no Eagle3 aux layers in this spec set
-    # Indexer at its real small page, NOT padded to the MLA page.
+    # The layout's idx_page is the per-SCHEDULER-block indexer page: the real
+    # 8.4 KiB indexer page (256-token block) scaled by mla_block/idx_block
+    # (2304/256 = 9), so the indexer spans the full 2304-token scheduler block
+    # instead of capping at 1971*256 = 504K tokens. NOT padded to the MLA page.
+    assert idx_page == 8448 * 9
     assert idx_page < mla_page
-    assert idx_page == 8448
 
 
 def test_lane_indexer_not_padded(glm5_lane):
