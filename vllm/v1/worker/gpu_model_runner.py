@@ -7271,6 +7271,14 @@ class GPUModelRunner(
             attn_backends = get_attn_backends_for_group(kv_cache_group_spec)
             attention_backend_maps.append(attn_backends[0])
             attention_backend_list.append(attn_backends[1])
+            from vllm.v1.glm5next.debug import dump_attn_group_resolution
+
+            dump_attn_group_resolution(
+                len(attention_backend_maps) - 1,
+                kv_cache_group_spec.layer_names,
+                len(attn_backends[1]),
+                kv_cache_group_spec.kv_cache_spec,
+            )
 
         # Resolve cudagraph_mode before actually initialize metadata_builders
         self._check_and_update_cudagraph_mode(
@@ -7589,6 +7597,19 @@ class GPUModelRunner(
                         )
                     else:
                         shape_block_size = kernel_block_size
+
+                    from vllm.v1.glm5next.debug import dump_indexer_reshape
+
+                    dump_indexer_reshape(
+                        layer_name,
+                        kv_cache_spec,
+                        kernel_block_size,
+                        num_blocks,
+                        num_blocks_per_kv_block,
+                        kernel_num_blocks,
+                        shape_block_size,
+                        raw_tensor.numel(),
+                    )
 
                     # Skipped layers (--kv-cache-dtype-skip-layers) need
                     # the unquantized shape.

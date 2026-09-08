@@ -193,11 +193,12 @@ class KVCacheCoordinator(ABC):
             The number of blocks to allocate.
         """
         num_blocks_to_allocate = 0
+        per_group: list[int] = []
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                d = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -207,7 +208,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                d = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],
@@ -216,6 +217,20 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                 )
+            num_blocks_to_allocate += d
+            per_group.append(d)
+        from vllm.v1.glm5next.debug import dump_group_allocation
+
+        dump_group_allocation(
+            request_id,
+            num_tokens,
+            total_computed_tokens,
+            apply_admission_cap,
+            self.kv_cache_config.kv_cache_groups,
+            per_group,
+            num_blocks_to_allocate,
+            self.block_pool.get_num_free_blocks(),
+        )
         return num_blocks_to_allocate
 
     def allocate_new_computed_blocks(

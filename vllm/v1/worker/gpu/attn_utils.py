@@ -139,6 +139,14 @@ def init_attn_backend(
                 group_map[key].layer_names.append(layer_name)
 
         attn_groups.append([group_map[key] for key in group_order])
+        from vllm.v1.glm5next.debug import dump_attn_group_resolution
+
+        dump_attn_group_resolution(
+            kv_cache_group_id,
+            layer_names,
+            len(group_map),
+            kv_cache_group_spec.kv_cache_spec,
+        )
 
     # Phase 2: pick a kernel block size per kv cache group that is supported
     # by all backends within that group.
