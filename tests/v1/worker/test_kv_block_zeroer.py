@@ -9,6 +9,7 @@ import torch
 
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    MLAAttentionSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.worker import utils as worker_utils
@@ -311,3 +312,51 @@ def test_warmup_respects_available_block_count():
     torch.accelerator.synchronize()
 
     assert torch.all(storage == 1)
+
+
+def test_compressed_indexer_zeroes_whole_blocks():
+    """Regression for the GLM-5.3-Flash kpool indexer boot crash.
+
+    The indexer spec presents the model-wide scheduler block (2304) to the KV
+    manager with compress_ratio=4, so storage_block_size=576 != block_size. The
+    tensor is allocated per scheduler block: (num_sched_blocks, 576, head). The
+    manager/kernel split (ratio = block_size // kernel_bs = 2304 // 256 = 9) is
+    a *kernel-read* concern; the physical zeroing unit is the whole compressed
+    block. Before the fix, the zeroer asserted kv.shape[0] % 9 == 0 and crashed
+    because num_sched_blocks (1865) is not a multiple of 9.
+    """
+    device = torch.device("cpu")
+    spec = MLAAttentionSpec(
+        block_size=2304,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_e4m3",
+        compress_ratio=4,
+    )
+    assert spec.storage_block_size == 576  # compressed: != block_size
+    num_sched_blocks = 1865
+    storage = torch.ones(
+        (num_sched_blocks, 576, 132), dtype=torch.uint8, device=device
+    )
+    layer_name = "model.layers.3.self_attn.indexer.k_cache"
+
+    zeroer = KVBlockZeroer(
+        device,
+        attn_groups_iter=[
+            AttentionGroup(_BlockFirstBackend, [layer_name], spec, 0)  # type: ignore[arg-type]
+        ],
+        kernel_block_sizes=[256],  # would give ratio=9 without the fix
+        cache_dtype="fp8",
+        static_forward_context={layer_name: SimpleNamespace(kv_cache=storage)},
+    )
+
+    # The whole-block unit: one segment per scheduler block, full 76032-byte
+    # page each, with the logical block stride equal to the physical block span.
+    # (Segment strides/pages are recorded in 4-byte words for the int32 kernel.)
+    assert zeroer._meta is not None
+    seg_addrs, seg_block_strides, seg_page_sizes, _, _, n_segs = zeroer._meta
+    assert n_segs == 1
+    assert seg_addrs.tolist() == [storage.data_ptr()]
+    assert seg_block_strides.tolist() == [76032 // 4]
+    assert seg_page_sizes.tolist() == [76032 // 4]
