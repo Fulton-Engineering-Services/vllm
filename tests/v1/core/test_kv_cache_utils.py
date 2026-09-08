@@ -2973,7 +2973,7 @@ def test_unify_kv_cache_page_size_glm5_next_indexer_must_pad():
         _FlashInferMLASparseBackendBase,
     )
     from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
-    from vllm.v1.kv_cache_interface import KpoolTailSpec
+    from vllm.v1.glm5next.kv_specs import KpoolTailSpec
 
     # The GB10 backends the specs are served by must keep opting into the
     # padded-page strided view; this is the line the bad revert removed.
@@ -3207,7 +3207,7 @@ def test_glm5_next_kpool_tail_builder_never_schedules_deepgemm():
     # that are never valid DeepGEMM pool pages (32/64). Show it with the
     # GLM-5.3-Flash TP4 numbers: 768x to block 3072 against the 1,572,864 B
     # unified page produced by the padded indexer group.
-    from vllm.v1.kv_cache_interface import KpoolTailSpec
+    from vllm.v1.glm5next.kv_specs import KpoolTailSpec
 
     tail = KpoolTailSpec(
         block_size=4,

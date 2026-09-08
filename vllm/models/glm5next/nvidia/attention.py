@@ -34,7 +34,8 @@ from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES  # noqa: F401  (runtime kernel tiling; not used in spec sizing)
-from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
+from vllm.v1.glm5next.kv_specs import KpoolTailSpec
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 logger = init_logger(__name__)
 

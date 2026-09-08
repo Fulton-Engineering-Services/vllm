@@ -28,7 +28,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
-    KpoolTailSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -36,6 +35,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
     replace_as,
 )
+from vllm.v1.glm5next.kv_specs import KpoolTailSpec
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
