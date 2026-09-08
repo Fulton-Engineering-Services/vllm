@@ -411,10 +411,17 @@ def _reshape_kv_cache(
             continue
 
         kv_cache_spec = group.kv_cache_spec
-        if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-            # use storage_block_size as the kernel block size for groups
-            # that apply a compression on block size (eg. DeepSeek V4).
-            kernel_block_size = kv_cache_spec.storage_block_size
+        is_compressed = kv_cache_spec.storage_block_size != kv_cache_spec.block_size
+        if is_compressed:
+            # Compressed spec (GLM-5.3 kpool indexer): the kernel reads
+            # 256-token blocks whose physical page is
+            # kernel_block_size // compress_ratio states (= 256//4 = 64).
+            # The manager block (2304) spans block_size // kernel_block_size
+            # (= 9) kernel blocks. The prior logic set
+            # kernel_block_size = storage_block_size (the whole 2304 block's
+            # pooled span, 576), collapsing the kernel split and producing the
+            # wrong (1865, 576, head) tensor instead of (1865*9, 64, head).
+            kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
         else:
             kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
 
@@ -434,12 +441,25 @@ def _reshape_kv_cache(
 
             if isinstance(kv_cache_spec, AttentionSpec):
                 has_attn = True
-                # Use storage_block_size: it equals block_size for uncompressed
-                # specs but is smaller for compressed ones (DeepSeek V4), which
-                # store block_size tokens in block_size // compress_ratio slots.
-                num_blocks_per_kv_block = (
-                    kv_cache_spec.storage_block_size // kernel_block_size
-                )
+                if is_compressed:
+                    # Kernel split: block_size tokens per manager block into
+                    # block_size // kernel_block_size kernel blocks, each with
+                    # kernel_block_size // compress_ratio physical states.
+                    num_blocks_per_kv_block = (
+                        kv_cache_spec.block_size // kernel_block_size
+                    )
+                    shape_block_size = (
+                        kernel_block_size // kv_cache_spec.compress_ratio
+                    )
+                else:
+                    # Use storage_block_size: it equals block_size for
+                    # uncompressed specs but is smaller for compressed ones
+                    # (DeepSeek V4), which store block_size tokens in
+                    # block_size // compress_ratio slots.
+                    num_blocks_per_kv_block = (
+                        kv_cache_spec.storage_block_size // kernel_block_size
+                    )
+                    shape_block_size = kernel_block_size
                 kernel_num_blocks = num_blocks * num_blocks_per_kv_block
                 # Skipped layers (--kv-cache-dtype-skip-layers) keep the
                 # unquantized shape; only the quantized primary uses the
@@ -451,7 +471,7 @@ def _reshape_kv_cache(
                 )
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
-                    kernel_block_size,
+                    shape_block_size,
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
                     cache_dtype_str=layer_cache_dtype,

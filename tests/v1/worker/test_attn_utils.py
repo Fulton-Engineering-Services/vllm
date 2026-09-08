@@ -425,4 +425,62 @@ def test_reshape_kv_first_kv_cache_keeps_layout_without_mamba():
     assert kv_cache.shape == (2, num_blocks, 16, 1, 2)
     # Nothing else indexes this allocation by page, so K and V stay split into
     # one contiguous half each.
+
+
+def test_reshape_glm5_compressed_indexer_kernel_split():
+    """GLM-5.3-Flash kpool indexer: manager block 2304, kernel block 256.
+
+    The indexer spec presents the model-wide scheduler block (2304) to the KV
+    manager (compress_ratio=4 -> storage_block_size=576, 9 pooled slots of 64
+    per block). The kernel splits each manager block into 256-token blocks, so
+    the physical page is kernel_block_size // compress_ratio = 64 states and
+    the tensor must be (num_sched_blocks * 9, 64, head). The pre-fix V1 reshape
+    set kernel_block_size = storage_block_size (576) and collapsed the split,
+    producing (num_sched_blocks, 576, head) -- the 2026-09-08 boot crash
+    (KVBlockZeroer: 1865 % 9 != 0) and a DeepGEMM-illegal block_kv=576.
+    """
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    num_sched_blocks = 1865
+    spec = MLAAttentionSpec(
+        block_size=2304,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_e4m3",
+        compress_ratio=4,  # index_kpool
+        tokens_per_state=4,
+    )
+    assert spec.storage_block_size == 576  # compressed: != block_size
+    page_bytes = spec.page_size_bytes  # 576 * 132 = 76032
+    assert page_bytes == 76032
+
+    raw_tensors = {
+        "idx": torch.zeros(page_bytes * num_sched_blocks, dtype=torch.uint8)
+    }
+    attn_groups = [
+        AttentionGroup(
+            backend=FakeIndexerBackend,
+            layer_names=["idx"],
+            kv_cache_spec=spec,
+            kv_cache_group_id=0,
+        )
+    ]
+
+    # kernel_block_sizes[0] = 256 (Glm5NextKpoolIndexerBackend kernel split).
+    kv_cache = _reshape_kv_cache(
+        attn_groups,
+        raw_tensors,
+        "fp8_e4m3",
+        [256],
+        {},
+    )["idx"]
+
+    # num_blocks_per_kv_block = 2304 // 256 = 9 kernel blocks per manager block;
+    # physical page = 256 // 4 = 64 states.
+    assert kv_cache.shape == (num_sched_blocks * 9, 64, 132)
+    # The zeroer's ratio check: kv.shape[0] % (block_size // kernel_bs) == 0.
+    assert kv_cache.shape[0] % (2304 // 256) == 0
+    # Numel must match the raw allocation exactly (no over-read).
+    assert kv_cache.numel() == page_bytes * num_sched_blocks
     assert kv_cache[1, 0].storage_offset() == num_blocks * 16 * 1 * 2
