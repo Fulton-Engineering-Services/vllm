@@ -23,4 +23,12 @@ def __getattr__(name: str):
         from vllm.v1.glm5next.tail_manager import KpoolTailManager
 
         return KpoolTailManager
+    if name == "try_build_kv_cache_groups":
+        from vllm.v1.glm5next.kv_groups import try_build_kv_cache_groups
+
+        return try_build_kv_cache_groups
+    if name == "detect_layout":
+        from vllm.v1.glm5next.tensor_layout import detect_layout
+
+        return detect_layout
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

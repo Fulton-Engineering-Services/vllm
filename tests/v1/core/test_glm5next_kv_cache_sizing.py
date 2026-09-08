@@ -2,7 +2,8 @@
 """Ground-truth tests for GLM-5.3-Flash (Glm5Next) KV-cache sizing on SM121.
 
 Reproduces the in-container KV cache spec construction for the
-glm53-flash-tp4 deployment (TP4, block-size 2304, fp8 KV) and checks the
+glm53-flash-tp4 deployment (TP4, block-size 2304, fp8 KV) via the model-free
+engine builders in ``vllm.v1.glm5next.spec_math`` and checks the
 resulting `_max_memory_usage_bytes_from_groups` estimate against the
 reference (day-0 tonyd2wild image) budget: ~24 GiB/rank serves a 1M-token
 context; ~22.6 GiB should serve well over 115K tokens.
@@ -16,18 +17,19 @@ hybrid-manager page unification pads every layer's page up to the MLA page
 (1,179,648 B) *without* restoring its block span, so each layer bills
 1,179,648 B per 256 tokens instead of per 2304 tokens.
 
-Run inside the deployment image:
-
-    docker run --rm -v <repo>/vllm:/src:ro -w /src \
-        --entrypoint python3 10.100.170.3:5000/vllm-gb10:0.28.0-sm121-cu133 \
-        -m pytest tests/v1/core/test_glm5next_kv_cache_sizing.py -v -s
+Runs on CPU-only hosts (no ``vllm.models.*`` imports, no GPU kernels).
 """
 
+import os
 from dataclasses import replace
 from math import gcd, lcm
 
 import pytest
 import torch
+
+# The deployment's 115,200-token pin exceeds Qwen3-derived
+# max_position_embeddings; the real deployment sets this env var too.
+os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
 
 from vllm.config import (
     CacheConfig,
@@ -38,10 +40,6 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
     set_current_vllm_config,
-)
-from vllm.models.glm5next.nvidia.attention import (
-    Glm5NextIndexerCache,
-    Glm5NextTailCache,
 )
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90 import (
     FlashInferMLASparseSM90Backend,
@@ -54,6 +52,11 @@ from vllm.v1.core.kv_cache_utils import (
     _check_enough_kv_cache_memory,
     _max_memory_usage_bytes_from_groups,
     get_kv_cache_groups,
+)
+from vllm.v1.glm5next.spec_math import (
+    build_indexer_spec,
+    build_tail_spec,
+    indexer_head_dim,
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -83,7 +86,10 @@ KV_CACHE_DTYPE = torch.uint8  # fp8_e4m3
 # KDA state shapes (mamba_utils.kda_state_shape, conv dim-first):
 #   conv = (conv_dim/tp, kernel-1+num_spec) = ((3*64*128)/4, 3) = (6144, 3) bf16
 #   recurrent = (heads/tp, head_dim, head_dim) = (16, 128, 128) fp32
-KDA_CONV_SHAPE = (LINEAR_NUM_HEADS * LINEAR_HEAD_DIM * 3 // TP_SIZE, LINEAR_CONV_KERNEL - 1)
+KDA_CONV_SHAPE = (
+    LINEAR_NUM_HEADS * LINEAR_HEAD_DIM * 3 // TP_SIZE,
+    LINEAR_CONV_KERNEL - 1,
+)
 KDA_REC_SHAPE = (LINEAR_NUM_HEADS // TP_SIZE, LINEAR_HEAD_DIM, LINEAR_HEAD_DIM)
 
 # Observed on gx10-node1 boot (2026-09-05 09:27): "Available KV cache memory: 22.62 GiB"
@@ -97,14 +103,7 @@ def _vllm_config() -> VllmConfig:
     # ModelConfig() with no model id skips HF loading (mirrors the pattern in
     # tests/v1/core/test_kv_cache_utils.py). Only the fields the sizing code
     # reads are overridden.
-    model_config = ModelConfig(
-        model="/model",
-        tokenizer="/model",
-        trust_remote_code=True,
-        dtype="bfloat16",
-        seed=0,
-        max_model_len=MAX_MODEL_LEN,
-    )
+    model_config = ModelConfig(max_model_len=MAX_MODEL_LEN)
     cache_config = CacheConfig(
         block_size=BLOCK_SIZE,
         gpu_memory_utilization=0.75,
@@ -126,7 +125,7 @@ def _vllm_config() -> VllmConfig:
         scheduler_config=scheduler_config,
         parallel_config=parallel_config,
         compilation_config=CompilationConfig(mode=0),
-        device_config=DeviceConfig(device="cuda"),
+        device_config=DeviceConfig(device="cpu"),
         speculative_config=None,
         kv_transfer_config=None,
     )
@@ -148,23 +147,16 @@ def _build_specs(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 head_size_v=0,
             )
             # Live indexer folds the fp8 per-128 scale into head_dim:
-            # head_dim = 128 + 128 // 128 * 4 = 132 (attention.py:283).
-            idx = Glm5NextIndexerCache(
-                head_dim=INDEX_HEAD_DIM + INDEX_HEAD_DIM // 128 * 4,
+            # head_dim = 128 + 128 // 128 * 4 = 132 (spec_math.indexer_head_dim).
+            specs[f"model.layers.{i}.self_attn.indexer"] = build_indexer_spec(
+                cache_block_size=cache_config.block_size,
+                head_dim=indexer_head_dim(INDEX_HEAD_DIM),
                 dtype=INDEXER_DTYPE,
-                prefix=f"model.layers.{i}.self_attn.indexer",
-                cache_config=cache_config,
                 index_kpool=INDEX_KPOOL,
             )
-            specs[idx.prefix] = idx.get_kv_cache_spec(vllm_config)
-            tail = Glm5NextTailCache(
-                head_dim=INDEX_HEAD_DIM,
-                dtype=torch.bfloat16,
-                prefix=f"model.layers.{i}.self_attn.indexer.tail",
-                cache_config=cache_config,
-                index_kpool=INDEX_KPOOL,
+            specs[f"model.layers.{i}.self_attn.indexer.tail"] = build_tail_spec(
+                head_dim=INDEX_HEAD_DIM, index_kpool=INDEX_KPOOL
             )
-            specs[tail.prefix] = tail.get_kv_cache_spec(vllm_config)
         else:
             specs[f"model.layers.{i}.linear_attn"] = MambaSpec(
                 block_size=BLOCK_SIZE,
@@ -178,14 +170,22 @@ def _build_specs(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     backend_by_name = {}
     for i in range(NUM_HIDDEN_LAYERS):
         if i in FULL_ATTN_LAYERS:
-            backend_by_name[f"model.layers.{i}.self_attn"] = FlashInferMLASparseSM90Backend
-            backend_by_name[f"model.layers.{i}.self_attn.indexer"] = Glm5NextKpoolIndexerBackend
-            backend_by_name[f"model.layers.{i}.self_attn.indexer.tail"] = KpoolTailBackend
+            backend_by_name[f"model.layers.{i}.self_attn"] = (
+                FlashInferMLASparseSM90Backend
+            )
+            backend_by_name[f"model.layers.{i}.self_attn.indexer"] = (
+                Glm5NextKpoolIndexerBackend
+            )
+            backend_by_name[f"model.layers.{i}.self_attn.indexer.tail"] = (
+                KpoolTailBackend
+            )
     out: dict[str, KVCacheSpec] = {}
     for name, spec in specs.items():
         backend = backend_by_name.get(name)
         if backend is not None and isinstance(spec, AttentionSpec):
-            spec = replace(spec, indexes_kv_by_block_stride=backend.indexes_kv_by_block_stride())
+            spec = replace(
+                spec, indexes_kv_by_block_stride=backend.indexes_kv_by_block_stride()
+            )
             spec = backend.customize_spec(spec)
         out[name] = spec
     return out
@@ -235,7 +235,9 @@ def test_needed_memory_fits_reference_budget(cfg_and_specs):
     available = int(EXPECTED_AVAILABLE_GIB * (1 << 30))
     group_size = max(len(g.layer_names) for g in groups)
     page_sizes = sorted({g.kv_cache_spec.page_size_bytes for g in groups})
-    print(f"\nneeded={needed / (1 << 30):.2f} GiB  available={available / (1 << 30):.2f} GiB")
+    print(
+        f"\nneeded={needed / (1 << 30):.2f} GiB  available={available / (1 << 30):.2f} GiB"
+    )
     print(f"groups={len(groups)} group_size={group_size} page_sizes={page_sizes}")
     for name, spec in specs.items():
         if "layers.3." in name or "layers.0." in name:
@@ -260,7 +262,9 @@ def test_max_memory_usage_per_token_reasonable(cfg_and_specs):
     vllm_config, _, groups = cfg_and_specs
     needed = _max_memory_usage_bytes_from_groups(vllm_config, groups)
     per_token = needed / MAX_MODEL_LEN
-    print(f"\nper-token: {per_token:.0f} B/token/rank ({per_token / 1024:.1f} KB/token/rank)")
+    print(
+        f"\nper-token: {per_token:.0f} B/token/rank ({per_token / 1024:.1f} KB/token/rank)"
+    )
     assert per_token < 100 * 1024, (
         f"{per_token / 1024:.1f} KB/token/rank; reference bills ~25 KB/token/rank"
     )
@@ -304,22 +308,15 @@ def _build_glm5_specs(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 cache_dtype_str="fp8_e4m3",
                 head_size_v=0,
             )
-            idx = Glm5NextIndexerCache(
-                head_dim=INDEX_HEAD_DIM + INDEX_HEAD_DIM // 128 * 4,
+            specs[f"model.layers.{i}.self_attn.indexer"] = build_indexer_spec(
+                cache_block_size=cache_config.block_size,
+                head_dim=indexer_head_dim(INDEX_HEAD_DIM),
                 dtype=INDEXER_DTYPE,
-                prefix=f"model.layers.{i}.self_attn.indexer",
-                cache_config=cache_config,
                 index_kpool=INDEX_KPOOL,
             )
-            specs[idx.prefix] = idx.get_kv_cache_spec(vllm_config)
-            tail = Glm5NextTailCache(
-                head_dim=INDEX_HEAD_DIM,
-                dtype=torch.bfloat16,
-                prefix=f"model.layers.{i}.self_attn.indexer.tail",
-                cache_config=cache_config,
-                index_kpool=INDEX_KPOOL,
+            specs[f"model.layers.{i}.self_attn.indexer.tail"] = build_tail_spec(
+                head_dim=INDEX_HEAD_DIM, index_kpool=INDEX_KPOOL
             )
-            specs[tail.prefix] = tail.get_kv_cache_spec(vllm_config)
         else:
             specs[f"model.layers.{i}.linear_attn"] = MambaSpec(
                 block_size=BLOCK_SIZE,
@@ -363,27 +360,15 @@ def test_lane_grouping_structure(glm5_lane):
     _, _, groups, layout = glm5_lane
     assert groups is not None, "glm5 lane returned None"
     assert layout is not None, "layout detection failed"
-    (
-        attn_group,
-        mamba_groups,
-        mla_names,
-        idx_names,
-        mla_page,
-        idx_page,
-        tail_names,
-        _tail_page,
-        draft_group,
-        hidden_names,
-    ) = layout
-    assert len(mla_names) == 11 and len(idx_names) == 11
-    assert len(tail_names) == 11 and len(mamba_groups) == 4
-    assert draft_group is not None
-    assert hidden_names == []  # no Eagle3 aux layers in this spec set
+    assert len(layout.mla_names) == 11 and len(layout.idx_names) == 11
+    assert len(layout.tail_names) == 11 and len(layout.mamba_groups) == 4
+    assert layout.draft_group is not None
+    assert layout.hidden_names == []  # no Eagle3 aux layers in this spec set
     # The indexer is uniform with the MLA at block_size=2304, so the layout's
     # idx_page is its real per-block page (576 storage slots x 132 B = 76032)
     # with NO padding to the 1.125 MiB MLA page and no 9x scaling.
-    assert idx_page == 76032
-    assert idx_page < mla_page
+    assert layout.idx_page == 76032
+    assert layout.idx_page < layout.mla_page
 
 
 def test_lane_indexer_not_padded(glm5_lane):
@@ -426,9 +411,11 @@ def test_lane_admission_fits_pin(glm5_lane):
     vllm_config, _, groups, layout = glm5_lane
     assert layout is not None
     needed = _max_memory_usage_bytes_from_groups(vllm_config, groups)
-    print(f"\nadmission demand: {needed / (1 << 30):.2f} GiB vs pin "
-          f"{KV_MEMORY_BYTES / (1 << 30):.1f} GiB = "
-          f"{KV_MEMORY_BYTES / needed:.2f}x")
+    print(
+        f"\nadmission demand: {needed / (1 << 30):.2f} GiB vs pin "
+        f"{KV_MEMORY_BYTES / (1 << 30):.1f} GiB = "
+        f"{KV_MEMORY_BYTES / needed:.2f}x"
+    )
     assert needed < KV_MEMORY_BYTES, (
         f"1M request needs {needed / (1 << 30):.2f} GiB > "
         f"{KV_MEMORY_BYTES / (1 << 30):.1f} GiB pin"
@@ -466,8 +453,7 @@ def test_lane_survives_eagle3_hidden_layers():
         assert groups is not None, "lane returned None with Eagle3 hidden layers"
         layout = _glm5_next_tensor_layout(groups)
         assert layout is not None
-        hidden_names = layout[9]
-        assert len(hidden_names) == 5
+        assert len(layout.hidden_names) == 5
         cfg = get_kv_cache_config_from_groups(vllm_config, groups, KV_MEMORY_BYTES)
         tokens = cfg.num_blocks * BLOCK_SIZE
         print(f"\nwith Eagle3 hidden: num_blocks={cfg.num_blocks} tokens={tokens}")
@@ -500,8 +486,8 @@ def test_kpool_tail_admission_bounded_working_set(glm5_lane):
         generate_scheduler_kv_cache_config,
         get_kv_cache_config_from_groups,
     )
-    from vllm.v1.core.single_type_kv_cache_manager import KpoolTailManager
     from vllm.v1.glm5next.kv_specs import KpoolTailSpec
+    from vllm.v1.glm5next.tail_manager import KpoolTailManager
     from vllm.v1.request import Request
 
     vllm_config, _, groups, _ = glm5_lane
@@ -561,4 +547,3 @@ def test_kpool_tail_admission_bounded_working_set(glm5_lane):
         assert real <= 8, f"tail holds {real} real blocks during decode"
     used = free0 - mgr.block_pool.get_num_free_blocks()
     assert used < 300, f"40K prompt consumed {used} blocks"
-

@@ -33,9 +33,9 @@ from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
-from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES  # noqa: F401  (runtime kernel tiling; not used in spec sizing)
-from vllm.v1.glm5next.kv_specs import KpoolTailSpec
-from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.utils.deep_gemm import (
+    PAGED_MQA_PAGE_SIZES,  # noqa: F401  (runtime kernel tiling; not used in spec sizing)
+)
 
 logger = init_logger(__name__)
 
@@ -122,23 +122,14 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         self._index_kpool = index_kpool
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig):
-        from dataclasses import replace
+        from vllm.v1.glm5next.spec_math import build_indexer_spec
 
-        spec = super().get_kv_cache_spec(vllm_config)
-        # Present the model-wide scheduler block (2304) to the KV manager so
-        # the indexer's pool accounting is uniform with the co-located MLA.
-        # compress_ratio = index_kpool is the kpool pooling ratio (4 tokens ->
-        # 1 state); it is load-bearing for the pooling math downstream
-        # (seq_lens // compress_ratio), NOT merely page sizing. The physical
-        # DeepGEMM page (64 states) is derived at the worker from the kernel
-        # block split, not from block_size // compress_ratio.
-        assert isinstance(spec, MLAAttentionSpec)
-        spec = replace(
-            spec,
-            compress_ratio=self._index_kpool,
-            tokens_per_state=self._index_kpool,
+        return build_indexer_spec(
+            cache_block_size=self.cache_config.block_size,
+            head_dim=self.head_dim,
+            dtype=self.dtype,
+            index_kpool=self._index_kpool,
         )
-        return spec
 
     def get_attn_backend(self):
         from vllm.v1.attention.backends.mla.indexer import (
@@ -180,16 +171,9 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
         self._index_kpool = index_kpool
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig):
-        # The two head slots form [K, gate score] in the generic
-        # [block, head, state, content] cache view.
-        return KpoolTailSpec(
-            block_size=self._index_kpool,
-            num_kv_heads=2,
-            head_size=self.head_dim,
-            head_size_v=0,
-            dtype=torch.bfloat16,
-            sliding_window=self._index_kpool,
-        )
+        from vllm.v1.glm5next.spec_math import build_tail_spec
+
+        return build_tail_spec(head_dim=self.head_dim, index_kpool=self._index_kpool)
 
     def get_attn_backend(self):
         from vllm.v1.attention.backends.mla.indexer import KpoolTailBackend
