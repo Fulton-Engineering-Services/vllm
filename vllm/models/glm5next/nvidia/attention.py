@@ -124,35 +124,21 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         from dataclasses import replace
 
         spec = super().get_kv_cache_spec(vllm_config)
-        # The kpool indexer must present block_size == the model-wide scheduler
-        # block (2304) to the KV manager so its pool accounting is uniform with
-        # the co-located MLA; pinning it to kernel_tile*kpool (256) made the
-        # manager allocate cdiv(tokens,256) blocks from the 2304-token pool,
-        # stalling admission on any long request. DeepGEMM still needs
-        # storage_block_size (= block_size // compress_ratio) in {32, 64}, so
-        # set compress_ratio = block_size // 64 (36) to keep storage_block_size
-        # = 64. The page is unchanged (page_size_bytes depends on
-        # storage_block_size, not block_size). The kpool compression is carried
-        # independently by tokens_per_state (= index_kpool), set by the base
-        # indexer; the runtime kernel-block split (supported [256]) divides the
-        # 2304 manager block into 256-token kernel blocks for the kernel.
+        # Present the model-wide scheduler block (2304) to the KV manager so
+        # the indexer's pool accounting is uniform with the co-located MLA;
+        # pinning block_size to kernel_tile*kpool (256) made the manager
+        # allocate cdiv(tokens,256) blocks from the 2304-token pool, stalling
+        # admission on long requests. compress_ratio stays = index_kpool so the
+        # kpool compression (tokens_per_state) and the DeepGEMM block_kv are
+        # both derived correctly downstream: the runtime hybrid block-table
+        # splits each 2304 manager block into 256-token kernel blocks, and the
+        # metadata builder reads the kernel block (256) -> storage_block_size
+        # = 256 // index_kpool = 64 (DeepGEMM-legal).
         assert isinstance(spec, MLAAttentionSpec)
-        block_size = spec.block_size  # model-wide scheduler block (2304)
-        kernel_tile = max(PAGED_MQA_PAGE_SIZES)  # 64 (DeepGEMM block_kv)
-        assert block_size % kernel_tile == 0, (
-            f"Glm5NextIndexerCache: block_size={block_size} must be a multiple "
-            f"of the DeepGEMM tile {kernel_tile}"
-        )
-        storage_block_size = block_size // (block_size // kernel_tile)
         spec = replace(
             spec,
-            block_size=block_size,
-            compress_ratio=block_size // kernel_tile,
+            compress_ratio=self._index_kpool,
             tokens_per_state=self._index_kpool,
-        )
-        assert spec.storage_block_size == kernel_tile, (
-            f"Glm5NextIndexerCache: storage_block_size={spec.storage_block_size} "
-            f"must be the DeepGEMM tile {kernel_tile} for block_kv"
         )
         return spec
 
