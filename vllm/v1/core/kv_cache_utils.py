@@ -967,9 +967,10 @@ def _pool_bytes_per_block(
         # GLM-5.3-Flash hybrid slot sharing: mamba layers co-own the MLA slot
         # tensors, and tail layers co-own the indexer slot tensors, so a block
         # costs one MLA page per MLA slot plus one indexer page per indexer
-        # slot. An exact-fit drafter rides the MLA tensors (no added bytes); a
-        # standalone drafter adds one page per drafter layer.
-        _, _, mla_names, idx_names, mla_page, idx_page, _, _, draft_group = glm5
+        # slot. An exact-fit drafter and the Eagle3 hidden-state layers ride
+        # the MLA tensors (no added bytes); a standalone drafter adds one page
+        # per drafter layer.
+        _, _, mla_names, idx_names, mla_page, idx_page, _, _, draft_group, _ = glm5
         per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
         if draft_group is not None:
             draft_page = next(
@@ -1187,7 +1188,7 @@ def _get_kv_cache_groups_glm5_next(
     attn_specs = {
         k: v
         for k, v in kv_cache_spec.items()
-        if not isinstance(v, (MambaSpec, KpoolTailSpec))
+        if not isinstance(v, (MambaSpec, KpoolTailSpec, HiddenStateCacheSpec))
         and type(v) is not SlidingWindowSpec
     }
     if not mamba_specs or not all(
@@ -1304,11 +1305,28 @@ def _get_kv_cache_groups_glm5_next(
         assert draft_uniform is not None
         draft_group = KVCacheGroupSpec(list(new_draft_specs), draft_uniform)
 
+    # HiddenStateCacheSpec layers (Eagle3 aux-capture for the drafter) were
+    # excluded from attn_specs above; re-add each as its own group aligned to
+    # the MLA page so they don't affect the slot-sharing layout.
+    hidden_groups: list[KVCacheGroupSpec] = []
+    hidden_specs = {
+        k: v for k, v in kv_cache_spec.items() if isinstance(v, HiddenStateCacheSpec)
+    }
+    if hidden_specs:
+        group_block_size = mla_specs[mla_names[0]].block_size
+        for name, spec in hidden_specs.items():
+            per_token = spec.num_kv_heads * spec.head_size * get_dtype_size(spec.dtype)
+            max_block_size = max(mla_page // per_token, 1)
+            new_bs = _largest_divisor_at_most(group_block_size, max_block_size)
+            aligned = replace(spec, block_size=new_bs, page_size_padded=mla_page)
+            hidden_groups.append(KVCacheGroupSpec([name], aligned))
+
     return (
         [attn_group, idx_group]
         + ([tail_group] if tail_group is not None else [])
         + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
         + ([draft_group] if draft_group is not None else [])
+        + hidden_groups
     )
 
 
@@ -1325,6 +1343,7 @@ def _glm5_next_tensor_layout(
         list[str],
         int,
         KVCacheGroupSpec | None,
+        list[str],
     ]
     | None
 ):
@@ -1334,7 +1353,7 @@ def _glm5_next_tensor_layout(
 
     Returns:
       - (attn_group, mamba_groups, mla_names, idx_names, mla_page, idx_page,
-         tail_names, tail_page, draft_group)
+         tail_names, tail_page, draft_group, hidden_names)
       - None if the group config is invalid
     """
     uniform_groups = [
@@ -1369,7 +1388,12 @@ def _glm5_next_tensor_layout(
             draft_group = g
     if attn_group is None or idx_group is None or not mamba_groups:
         return None
-    if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
+    # HiddenStateCacheSpec groups (Eagle3 aux) are neither uniform-type nor
+    # mamba; exclude them from the group-count check.
+    non_hidden_groups = [
+        g for g in kv_cache_groups if not isinstance(g.kv_cache_spec, HiddenStateCacheSpec)
+    ]
+    if len(uniform_groups) + len(mamba_groups) != len(non_hidden_groups):
         return None
     attn_uniform = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
     if not all(
@@ -1422,6 +1446,14 @@ def _glm5_next_tensor_layout(
         if len(tail_pages) != 1:
             return None
         tail_page = tail_pages.pop()
+    # Eagle3 aux hidden-state layers (padded to mla_page) slot-share the first
+    # len(hidden) MLA tensors exactly like the mamba layers do.
+    hidden_names = [
+        name
+        for g in kv_cache_groups
+        if isinstance(g.kv_cache_spec, HiddenStateCacheSpec)
+        for name in g.layer_names
+    ]
     return (
         attn_group,
         mamba_groups,
@@ -1432,6 +1464,7 @@ def _glm5_next_tensor_layout(
         tail_names,
         tail_page,
         draft_group,
+        hidden_names,
     )
 
 
@@ -1717,6 +1750,7 @@ def get_kv_cache_config_from_groups(
             tail_names,
             _tail_page,
             draft_group,
+            hidden_names,
         ) = glm5n
         draft_names: list[str] = []
         draft_page = 0
@@ -1746,7 +1780,8 @@ def get_kv_cache_config_from_groups(
                 size=mla_page * num_blocks,
                 shared_by=[mla_name]
                 + [g.layer_names[i] for g in mamba_groups if i < len(g.layer_names)]
-                + ([draft_names[i]] if draft_shared and i < len(draft_names) else []),
+                + ([draft_names[i]] if draft_shared and i < len(draft_names) else [])
+                + ([hidden_names[i]] if i < len(hidden_names) else []),
             )
             for i, mla_name in enumerate(mla_names)
         ] + [
@@ -2349,6 +2384,7 @@ def _max_memory_usage_bytes_from_groups(
             tail_names,
             _tail_page,
             draft_group,
+            hidden_names,
         ) = glm5n
         uniform_spec = attn_group.kv_cache_spec
         assert isinstance(uniform_spec, UniformTypeKVCacheSpecs)
@@ -2361,6 +2397,14 @@ def _max_memory_usage_bytes_from_groups(
         if tail_names:
             # Tail: 1 block/req, drawn from the shared pool.
             blocks_needed += 1
+        if hidden_names:
+            # Eagle3 aux hidden-state layers: slot-share the MLA tensors (no
+            # added bytes) but each draws block-id demand like a full-attention
+            # layer. Use the attn group's per-request block count.
+            blocks_needed += len(hidden_names) * cdiv(
+                vllm_config.model_config.max_model_len,
+                attn_group.kv_cache_spec.block_size,
+            )
         per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
         if draft_group is not None:
             # Charge the drafter's window-bounded block-id demand; a standalone
