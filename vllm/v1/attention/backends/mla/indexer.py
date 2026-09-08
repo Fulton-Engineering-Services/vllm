@@ -220,6 +220,7 @@ class B12xNonCompressedIndexerBackend(DeepseekV32IndexerBackend):
         return "B12X_NON_COMPRESSED_INDEXER"
 
 
+@dataclass
 class DeepseekV32IndexerPrefillChunkMetadata:
     block_table: torch.Tensor
     # Under DCP (dcp_world_size > 1) these hold this rank's local row bounds;
