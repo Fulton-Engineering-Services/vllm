@@ -2164,6 +2164,16 @@ def get_kv_cache_groups(
         # most models. Allocate the same amount of memory for
         # each layer.
         return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+    elif glm5_groups := _get_kv_cache_groups_glm5_next(vllm_config, kv_cache_spec):
+        # GLM-5.3-Flash case: MLA target group + kpool indexer group at their
+        # REAL page sizes + mamba groups slot-sharing the MLA tensors + the
+        # kpool-tail and (DFlash2) drafter groups. This keeps the indexer at
+        # its real 8.4 KiB page instead of padding it to the 1.125 MiB MLA
+        # page (which collapses the pool ~8x). Must precede
+        # group_and_unify_kv_cache_specs, which would unify the indexer onto
+        # the MLA page, and the generic uniform-page path, which cannot serve
+        # this model.
+        return glm5_groups
     elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
         # All layers need the same number of token slots (e.g., all layers are
         # full attention, or all layers are sliding window attention with the
@@ -2177,14 +2187,6 @@ def get_kv_cache_groups(
         kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
-    elif glm5_groups := _get_kv_cache_groups_glm5_next(vllm_config, kv_cache_spec):
-        # GLM-5.3-Flash case: one uniform MLA(+kpool indexer) attention group
-        # plus mamba groups whose layers share the MLA layers' slot tensors,
-        # plus the kpool-tail and (DFlash2) drafter groups. This keeps every
-        # cache at its real page size instead of padding the indexer page up
-        # to the MLA page (which collapses the pool ~8x). Must precede the
-        # generic uniform-page-size path, which cannot serve this model.
-        return glm5_groups
 
     # Pull HiddenStateCacheSpec layers out before the general multi-group
     # path so they don't affect page-size unification or grouping.
