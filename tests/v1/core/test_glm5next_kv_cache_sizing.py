@@ -268,7 +268,8 @@ def test_max_memory_usage_per_token_reasonable(cfg_and_specs):
     needed = _max_memory_usage_bytes_from_groups(vllm_config, groups)
     per_token = needed / MAX_MODEL_LEN
     print(
-        f"\nper-token: {per_token:.0f} B/token/rank ({per_token / 1024:.1f} KB/token/rank)"
+        f"\nper-token: {per_token:.0f} B/token/rank "
+        f"({per_token / 1024:.1f} KB/token/rank)"
     )
     assert per_token < 100 * 1024, (
         f"{per_token / 1024:.1f} KB/token/rank; reference bills ~25 KB/token/rank"
