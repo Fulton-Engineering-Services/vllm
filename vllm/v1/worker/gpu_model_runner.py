@@ -7267,10 +7267,22 @@ class GPUModelRunner(
 
         attention_backend_maps = []
         attention_backend_list = []
-        for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
+        for _gid0, kv_cache_group_spec in enumerate(kv_cache_config.kv_cache_groups):
             attn_backends = get_attn_backends_for_group(kv_cache_group_spec)
             attention_backend_maps.append(attn_backends[0])
             attention_backend_list.append(attn_backends[1])
+            # TEMP diagnostic: which layers resolved to backends per KV group.
+            logger.warning(
+                "GLM5 GROUP gid=%d n_layers=%d resolved_backends=%d spec=%s "
+                "layer0=%s",
+                _gid0,
+                len(kv_cache_group_spec.layer_names),
+                len(attn_backends[1]),
+                type(kv_cache_group_spec.kv_cache_spec).__name__,
+                kv_cache_group_spec.layer_names[0]
+                if kv_cache_group_spec.layer_names
+                else "-",
+            )
 
         # Resolve cudagraph_mode before actually initialize metadata_builders
         self._check_and_update_cudagraph_mode(
