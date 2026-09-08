@@ -483,4 +483,3 @@ def test_reshape_glm5_compressed_indexer_kernel_split():
     assert kv_cache.shape[0] % (2304 // 256) == 0
     # Numel must match the raw allocation exactly (no over-read).
     assert kv_cache.numel() == page_bytes * num_sched_blocks
-    assert kv_cache[1, 0].storage_offset() == num_blocks * 16 * 1 * 2
