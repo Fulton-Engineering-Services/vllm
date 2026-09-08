@@ -365,10 +365,12 @@ def test_lane_grouping_structure(glm5_lane):
         tail_names,
         _tail_page,
         draft_group,
+        hidden_names,
     ) = layout
     assert len(mla_names) == 11 and len(idx_names) == 11
     assert len(tail_names) == 11 and len(mamba_groups) == 4
     assert draft_group is not None
+    assert hidden_names == []  # no Eagle3 aux layers in this spec set
     # Indexer at its real small page, NOT padded to the MLA page.
     assert idx_page < mla_page
     assert idx_page == 8448
@@ -421,3 +423,49 @@ def test_lane_admission_fits_pin(glm5_lane):
         f"1M request needs {needed / (1 << 30):.2f} GiB > "
         f"{KV_MEMORY_BYTES / (1 << 30):.1f} GiB pin"
     )
+
+
+def test_lane_survives_eagle3_hidden_layers():
+    """Regression: the DFlash2 drafter's Eagle3 aux-capture layers are
+    HiddenStateCacheSpec. On the first restored lane they fell into attn_specs,
+    made the gate return None, and the live boot dropped to the generic path
+    (448K tokens, mamba page padding 0.70%). The lane must exclude them from
+    attn_specs, slot-share them into the MLA tensors, and still serve 1M."""
+    from vllm.v1.core.kv_cache_utils import (
+        _get_kv_cache_groups_glm5_next,
+        _glm5_next_tensor_layout,
+        get_kv_cache_config_from_groups,
+    )
+    from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
+
+    vllm_config = _vllm_config()
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    with set_current_vllm_config(vllm_config):
+        specs = _build_glm5_specs(vllm_config)
+        # Add the 5 Eagle3 aux hidden-state layers the live boot injects.
+        for a in [6, 15, 25, 34, 43]:
+            specs[f"model.layers.{a}.aux_hidden_state"] = HiddenStateCacheSpec(
+                block_size=BLOCK_SIZE,
+                num_kv_heads=16,
+                head_size=2048,
+                dtype=torch.bfloat16,
+            )
+        groups = _get_kv_cache_groups_glm5_next(vllm_config, specs)
+        assert groups is not None, "lane returned None with Eagle3 hidden layers"
+        layout = _glm5_next_tensor_layout(groups)
+        assert layout is not None
+        hidden_names = layout[9]
+        assert len(hidden_names) == 5
+        cfg = get_kv_cache_config_from_groups(vllm_config, groups, KV_MEMORY_BYTES)
+        tokens = cfg.num_blocks * BLOCK_SIZE
+        print(f"\nwith Eagle3 hidden: num_blocks={cfg.num_blocks} tokens={tokens}")
+        assert tokens > 1_000_000
+        # Hidden layers slot-share the first 5 MLA tensors (no extra tensors).
+        mla_tensors = [
+            t
+            for t in cfg.kv_cache_tensors
+            if t.shared_by and t.shared_by[0].endswith("self_attn")
+        ]
+        assert any(
+            any("aux_hidden_state" in n for n in t.shared_by) for t in mla_tensors
+        )
