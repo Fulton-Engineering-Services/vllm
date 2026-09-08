@@ -1194,9 +1194,28 @@ def _get_kv_cache_groups_glm5_next(
     if not mamba_specs or not all(
         type(s) is MLAAttentionSpec for s in attn_specs.values()
     ):
+        # TEMP diagnostic: why did the glm5 lane reject this spec set?
+        if mamba_specs:
+            bad = {
+                n: type(s).__name__
+                for n, s in attn_specs.items()
+                if type(s) is not MLAAttentionSpec
+            }
+            logger.warning(
+                "glm5 lane: rejecting (non-MLA attn specs=%s, n_mamba=%d, "
+                "n_tail=%d, n_draft=%d)",
+                bad,
+                len(mamba_specs),
+                len(tail_specs),
+                len(draft_specs),
+            )
         return None
     mla_specs = cast(dict[str, MLAAttentionSpec], attn_specs)
     if not any(s.compress_ratio > 1 for s in mla_specs.values()):
+        logger.warning(
+            "glm5 lane: rejecting (no compress_ratio>1 indexer among %d attn specs)",
+            len(mla_specs),
+        )
         return None
 
     assert all(s.page_size_padded is None for s in mla_specs.values())
