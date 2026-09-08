@@ -168,7 +168,14 @@ class KVBlockZeroer:
                 el = kv.element_size()
                 block_stride_bytes = kv.stride(block_dim) * el
                 assert block_stride_bytes % 4 == 0
-                assert kv.shape[block_dim] % ratio == 0
+                if kv.shape[block_dim] % ratio != 0:
+                    raise AssertionError(
+                        f"KVBlockZeroer: layer={layer_name} group={group.kv_cache_group_id} "
+                        f"spec={type(spec).__name__} spec.block_size={spec.block_size} "
+                        f"kernel_bs={kernel_bs} ratio={ratio} "
+                        f"kv.shape={tuple(kv.shape)} block_dim={block_dim} "
+                        f"kv.shape[block_dim]={kv.shape[block_dim]}"
+                    )
                 outer_dims = [
                     d
                     for d in range(block_dim)
