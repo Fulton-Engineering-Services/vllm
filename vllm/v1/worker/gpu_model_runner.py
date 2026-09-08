@@ -7590,6 +7590,27 @@ class GPUModelRunner(
                     else:
                         shape_block_size = kernel_block_size
 
+                    # TEMP diagnostic for the GLM-5.3 indexer reshape.
+                    if "indexer" in layer_name and ".tail" not in layer_name:
+                        logger.warning(
+                            "GLM5 IDX RESHAPE: layer=%s spec.block_size=%d "
+                            "storage_block_size=%d compress_ratio=%s "
+                            "kernel_block_size=%d num_blocks=%d "
+                            "num_blocks_per_kv_block=%d kernel_num_blocks=%d "
+                            "shape_block_size=%d raw.numel=%d page=%d",
+                            layer_name,
+                            kv_cache_spec.block_size,
+                            kv_cache_spec.storage_block_size,
+                            getattr(kv_cache_spec, "compress_ratio", "-"),
+                            kernel_block_size,
+                            num_blocks,
+                            num_blocks_per_kv_block,
+                            kernel_num_blocks,
+                            shape_block_size,
+                            raw_tensor.numel(),
+                            kv_cache_spec.page_size_bytes,
+                        )
+
                     # Skipped layers (--kv-cache-dtype-skip-layers) need
                     # the unquantized shape.
                     layer_cache_dtype_str = (
