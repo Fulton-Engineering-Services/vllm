@@ -1473,13 +1473,28 @@ def _glm5_next_tensor_layout(
         if isinstance(g.kv_cache_spec, HiddenStateCacheSpec)
         for name in g.layer_names
     ]
+    # The kpool indexer runs at a finer block_size than the MLA/scheduler
+    # block, so each indexer layer needs (mla_block / idx_block) real pages per
+    # scheduler block. Surface the scaled per-scheduler-block indexer page so
+    # tensor emission and accounting never under-allocate it (the generic path
+    # hides this by unifying block sizes; the lane keeps them real).
+    idx_page = idx_pages.pop()
+    idx_block_size = cast(
+        UniformTypeKVCacheSpecs, idx_group.kv_cache_spec
+    ).block_size
+    mla_block_size = cast(
+        UniformTypeKVCacheSpecs, attn_group.kv_cache_spec
+    ).block_size
+    if mla_block_size % idx_block_size != 0:
+        return None
+    idx_page_per_sched = idx_page * (mla_block_size // idx_block_size)
     return (
         attn_group,
         mamba_groups,
         mla_names,
         idx_names,
         mla_page,
-        idx_pages.pop(),
+        idx_page_per_sched,
         tail_names,
         tail_page,
         draft_group,
@@ -1805,7 +1820,9 @@ def get_kv_cache_config_from_groups(
             for i, mla_name in enumerate(mla_names)
         ] + [
             # Each indexer tensor is co-owned by its sibling tail layer (paired
-            # by model-layer order).
+            # by model-layer order). idx_page here is the per-scheduler-block
+            # indexer page (already scaled by mla_block/idx_block in the layout),
+            # so the tensor spans the full 2304-token scheduler block.
             KVCacheTensor(
                 size=idx_page * num_blocks,
                 shared_by=(
