@@ -68,6 +68,7 @@ def _vllm_config(max_model_len: int = 16):
         parallel_config=ParallelConfig(
             tensor_parallel_size=4,
             pipeline_parallel_size=1,
+            distributed_executor_backend="mp",
         ),
         compilation_config=CompilationConfig(mode=0),
         device_config=DeviceConfig(device="cpu"),

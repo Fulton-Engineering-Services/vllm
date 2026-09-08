@@ -118,6 +118,7 @@ def _vllm_config() -> VllmConfig:
     parallel_config = ParallelConfig(
         tensor_parallel_size=4,
         pipeline_parallel_size=1,
+        distributed_executor_backend="mp",
     )
     return VllmConfig(
         model_config=model_config,
