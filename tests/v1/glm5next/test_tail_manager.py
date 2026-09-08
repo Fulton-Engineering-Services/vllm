@@ -3,10 +3,8 @@
 """Unit tests for the GLM-5.3 kpool tail ring-buffer manager (CPU-only)."""
 
 import pytest
-import torch
 
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.glm5next.kv_specs import KpoolTailSpec
 from vllm.v1.glm5next.tail_manager import KpoolTailManager
 
 pytestmark = pytest.mark.cpu_test
@@ -18,13 +16,10 @@ SLIDING_WINDOW = 4
 
 
 def get_tail_manager(block_pool: BlockPool) -> KpoolTailManager:
-    spec = KpoolTailSpec(
-        block_size=BLOCK_SIZE,
-        num_kv_heads=2,
-        head_size=128,
-        dtype=torch.bfloat16,
-        sliding_window=SLIDING_WINDOW,
-    )
+    from vllm.v1.glm5next.spec_math import build_tail_spec
+
+    spec = build_tail_spec(head_dim=128, index_kpool=SLIDING_WINDOW)
+    assert spec.block_size == BLOCK_SIZE
     return KpoolTailManager(
         spec,
         block_pool=block_pool,

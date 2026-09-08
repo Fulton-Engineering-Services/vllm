@@ -18,7 +18,9 @@ from vllm.v1.kv_cache_interface import MLAAttentionSpec
 INDEXER_QUANT_BLOCK_SIZE = 128
 
 
-def indexer_head_dim(index_head_dim: int, quant_block_size: int = 128) -> int:
+def indexer_head_dim(
+    index_head_dim: int, quant_block_size: int = INDEXER_QUANT_BLOCK_SIZE
+) -> int:
     """Stored indexer head size after folding the fp8 per-128 scale in.
 
     head_dim = index_head_dim + index_head_dim // quant_block_size * 4

@@ -12,8 +12,8 @@ from unittest.mock import patch
 import torch
 
 import vllm.envs as envs
-from vllm.compilation.counter import compilation_counter
 from vllm.compilation import monitor
+from vllm.compilation.counter import compilation_counter
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id

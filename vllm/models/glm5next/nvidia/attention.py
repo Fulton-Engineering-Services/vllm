@@ -254,8 +254,10 @@ class Indexer(nn.Module):
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
         #       per self.quant_block_size element
+        from vllm.v1.glm5next.spec_math import indexer_head_dim
+
         self.k_cache = Glm5NextIndexerCache(
-            head_dim=self.head_dim + self.head_dim // self.quant_block_size * 4,
+            head_dim=indexer_head_dim(self.head_dim, self.quant_block_size),
             dtype=torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,

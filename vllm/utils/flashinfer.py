@@ -260,6 +260,7 @@ def has_flashinfer_sm90_nope_mla() -> bool:
         return False
     try:
         import inspect
+
         from flashinfer.mla import BatchMLAPagedAttentionWrapper
     except ImportError:
         return False

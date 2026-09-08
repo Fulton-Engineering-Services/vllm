@@ -7,6 +7,7 @@ path (group structure, tensor emission, admission pins) is covered by
 ``tests/v1/core/test_glm5next_kv_cache_sizing.py``.
 """
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -52,15 +53,15 @@ def _mla_target() -> MLAAttentionSpec:
 
 
 def _indexer() -> MLAAttentionSpec:
-    return MLAAttentionSpec(
-        block_size=BLOCK_SIZE,
-        num_kv_heads=1,
-        head_size=132,
+    from vllm.v1.glm5next.spec_math import build_indexer_spec, indexer_head_dim
+
+    spec = build_indexer_spec(
+        cache_block_size=BLOCK_SIZE,
+        head_dim=indexer_head_dim(128),
         dtype=torch.uint8,
-        cache_dtype_str="fp8_e4m3",
-        head_size_v=0,
-        compress_ratio=4,
+        index_kpool=4,
     )
+    return replace(spec, cache_dtype_str="fp8_e4m3")
 
 
 def _mamba() -> MambaSpec:
@@ -74,13 +75,9 @@ def _mamba() -> MambaSpec:
 
 
 def _tail() -> KpoolTailSpec:
-    return KpoolTailSpec(
-        block_size=4,
-        num_kv_heads=2,
-        head_size=128,
-        dtype=torch.bfloat16,
-        sliding_window=4,
-    )
+    from vllm.v1.glm5next.spec_math import build_tail_spec
+
+    return build_tail_spec(head_dim=128, index_kpool=4)
 
 
 def _full_attn() -> FullAttentionSpec:
