@@ -410,6 +410,14 @@ def prepare_kernel_block_sizes(
             selected_kernel_size = select_common_block_size(
                 kv_manager_block_size, group_backends
             )
+            # TEMP diagnostic for the GLM-5.3 indexer kernel-block selection.
+            logger.warning(
+                "GLM5 KBS gid=%d manager_block=%d backends=%s selected=%d",
+                kv_cache_gid,
+                kv_manager_block_size,
+                [b.__name__ for b in group_backends],
+                selected_kernel_size,
+            )
             kernel_block_sizes.append(selected_kernel_size)
         elif isinstance(kv_cache_spec, MambaSpec):
             # This is likely Mamba or other non-attention cache, no splitting.
