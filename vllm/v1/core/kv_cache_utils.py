@@ -1242,9 +1242,9 @@ def _get_kv_cache_groups_glm5_next(
 
     any_mamba = next(iter(mamba_specs.values()))
     assert all(spec == any_mamba for spec in mamba_specs.values())
-    if any_mamba.real_page_size_bytes > mla_page:
+    if any_mamba.page_size_bytes > mla_page:
         raise ValueError(
-            f"the mamba state page ({any_mamba.real_page_size_bytes} bytes) "
+            f"the mamba state page ({any_mamba.page_size_bytes} bytes) "
             f"does not fit the MLA page ({mla_page} bytes); increase tensor "
             "parallelism or use a wider KV cache dtype"
         )
