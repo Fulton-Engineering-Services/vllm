@@ -213,13 +213,18 @@ def test_indexer_spec_block_size_preserved(cfg_and_specs):
         f"page={idx_spec.page_size_bytes}"
     )
     # The indexer presents the model-wide scheduler block (2304) to the KV
-    # manager so its pool accounting is uniform with the co-located MLA;
-    # storage_block_size stays at the DeepGEMM tile (64) via compress_ratio =
-    # block_size // 64 (36). The kpool compression rides tokens_per_state (4).
+    # manager so its pool accounting is uniform with the co-located MLA.
+    # compress_ratio = index_kpool (4); the runtime hybrid block-table splits
+    # each 2304 manager block into 256-token kernel blocks, and the metadata
+    # builder reads the kernel block -> storage_block_size = 256 // 4 = 64
+    # (DeepGEMM-legal). At construction the spec's storage_block_size is 576
+    # (2304 // 4); the DeepGEMM block_kv is derived from the kernel block.
     assert idx_spec.block_size == BLOCK_SIZE
-    assert idx_spec.storage_block_size == 64
+    assert idx_spec.compress_ratio == INDEX_KPOOL
     assert idx_spec.tokens_per_state == INDEX_KPOOL
-    assert idx_spec.compress_ratio == BLOCK_SIZE // 64
+    # Page must cover the full 2304-token block at the kpool-compressed density
+    # (576 storage slots x 132 B = 76032), NOT padded to the MLA page.
+    assert idx_spec.page_size_bytes == 76032
 
 
 def test_needed_memory_fits_reference_budget(cfg_and_specs):
@@ -371,10 +376,10 @@ def test_lane_grouping_structure(glm5_lane):
     assert len(tail_names) == 11 and len(mamba_groups) == 4
     assert draft_group is not None
     assert hidden_names == []  # no Eagle3 aux layers in this spec set
-    # The indexer is uniform with the MLA at block_size=2304 (storage 64 via
-    # compress_ratio=36), so the layout's idx_page is its real 8.4 KiB page with
-    # NO padding to the MLA page and no 9x scaling (idx_block == mla_block now).
-    assert idx_page == 8448
+    # The indexer is uniform with the MLA at block_size=2304, so the layout's
+    # idx_page is its real per-block page (576 storage slots x 132 B = 76032)
+    # with NO padding to the 1.125 MiB MLA page and no 9x scaling.
+    assert idx_page == 76032
     assert idx_page < mla_page
 
 
@@ -382,7 +387,7 @@ def test_lane_indexer_not_padded(glm5_lane):
     """The indexer's real page must survive (no 138x MLA-page padding)."""
     _, specs, _, _ = glm5_lane
     idx_spec = specs["model.layers.3.self_attn.indexer"]
-    assert idx_spec.page_size_bytes == 8448
+    assert idx_spec.page_size_bytes == 76032
     assert idx_spec.page_size_padded is None
 
 
