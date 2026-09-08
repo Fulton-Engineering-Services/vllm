@@ -1195,24 +1195,43 @@ def _get_kv_cache_groups_glm5_next(
     ):
         return None
     mla_specs = cast(dict[str, MLAAttentionSpec], attn_specs)
-    idx_pages = {s.page_size_bytes for s in mla_specs.values() if s.compress_ratio > 1}
-    if not idx_pages:
+    if not any(s.compress_ratio > 1 for s in mla_specs.values()):
         return None
 
     assert all(s.page_size_padded is None for s in mla_specs.values())
-    assert len(idx_pages) == 1
+    # The MLA target (block_size = model block, compress_ratio == 1) and the
+    # kpool indexer (block_size = kernel_tile * kpool, compress_ratio == kpool)
+    # have different block sizes and real page sizes. They CANNOT share a
+    # UniformTypeKVCacheSpecs (which requires one block_size), and the generic
+    # path's page unification would pad the indexer's 8.4 KiB page to the MLA
+    # page (138x). Keep them in SEPARATE groups at their real sizes; the
+    # indexer tensor holds its own small pages and the mamba/drafter/tail
+    # slot-share the MLA / indexer tensors.
     mla_names = [n for n, s in mla_specs.items() if s.compress_ratio == 1]
+    idx_names = [n for n, s in mla_specs.items() if s.compress_ratio > 1]
     mla_pages = {mla_specs[n].page_size_bytes for n in mla_names}
-    assert len(mla_pages) == 1
+    idx_pages = {mla_specs[n].page_size_bytes for n in idx_names}
+    assert len(mla_pages) == 1 and len(idx_pages) == 1
     mla_page = mla_pages.pop()
-    uniform_spec = UniformTypeKVCacheSpecs.from_specs(attn_specs)
-    assert uniform_spec is not None
+    idx_page = idx_pages.pop()
+    idx_block_size = mla_specs[idx_names[0]].block_size
+    assert all(mla_specs[n].block_size == idx_block_size for n in idx_names)
+
+    mla_uniform = UniformTypeKVCacheSpecs.from_specs(
+        {n: mla_specs[n] for n in mla_names}
+    )
+    assert mla_uniform is not None
+    attn_group = KVCacheGroupSpec(list(mla_names), mla_uniform)
+    idx_uniform = UniformTypeKVCacheSpecs.from_specs(
+        {n: mla_specs[n] for n in idx_names}
+    )
+    assert idx_uniform is not None
+    idx_group = KVCacheGroupSpec(list(idx_names), idx_uniform)
 
     # Keep all indexer tails in one group and pad their pages to the indexer
     # page size so each tail can share its sibling indexer's storage.
     tail_group = None
     if tail_specs:
-        idx_page = next(iter(idx_pages))
         padded_tail_specs: dict[str, KVCacheSpec] = {
             name: replace(s, page_size_padded=idx_page)
             for name, s in tail_specs.items()
@@ -1286,7 +1305,7 @@ def _get_kv_cache_groups_glm5_next(
         draft_group = KVCacheGroupSpec(list(new_draft_specs), draft_uniform)
 
     return (
-        [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
+        [attn_group, idx_group]
         + ([tail_group] if tail_group is not None else [])
         + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
         + ([draft_group] if draft_group is not None else [])
@@ -1326,22 +1345,29 @@ def _glm5_next_tensor_layout(
     mamba_groups = [
         g for g in kv_cache_groups if isinstance(g.kv_cache_spec, MambaSpec)
     ]
-    # The MLA(+indexer) attn group, the kpool tail group, and the drafter group
-    # are all UniformTypeKVCacheSpecs; distinguish by the inner spec type.
+    # The MLA target group, the kpool indexer group, the kpool tail group, and
+    # the drafter group are all UniformTypeKVCacheSpecs; distinguish by the
+    # inner spec type and (for MLA) the compress_ratio.
     attn_group: KVCacheGroupSpec | None = None
+    idx_group: KVCacheGroupSpec | None = None
     tail_group: KVCacheGroupSpec | None = None
     draft_group: KVCacheGroupSpec | None = None
     for g in uniform_groups:
         group_inner = cast(UniformTypeKVCacheSpecs, g.kv_cache_spec).kv_cache_specs
         if all(type(s) is MLAAttentionSpec for s in group_inner.values()):
-            attn_group = g
+            if all(s.compress_ratio == 1 for s in group_inner.values()):
+                attn_group = g
+            elif all(s.compress_ratio > 1 for s in group_inner.values()):
+                idx_group = g
+            else:
+                return None
         elif all(isinstance(s, KpoolTailSpec) for s in group_inner.values()):
             tail_group = g
         elif group_inner and all(
             type(s) is SlidingWindowSpec for s in group_inner.values()
         ):
             draft_group = g
-    if attn_group is None or not mamba_groups:
+    if attn_group is None or idx_group is None or not mamba_groups:
         return None
     if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
         return None
@@ -1352,10 +1378,14 @@ def _glm5_next_tensor_layout(
     ):
         return None
     inner = cast(dict[str, MLAAttentionSpec], attn_uniform.kv_cache_specs)
-    mla_names = [n for n in attn_group.layer_names if inner[n].compress_ratio == 1]
-    idx_names = [n for n in attn_group.layer_names if inner[n].compress_ratio > 1]
+    idx_inner = cast(
+        dict[str, MLAAttentionSpec],
+        cast(UniformTypeKVCacheSpecs, idx_group.kv_cache_spec).kv_cache_specs,
+    )
+    mla_names = list(attn_group.layer_names)
+    idx_names = list(idx_group.layer_names)
     mla_pages = {inner[n].page_size_bytes for n in mla_names}
-    idx_pages = {inner[n].page_size_bytes for n in idx_names}
+    idx_pages = {idx_inner[n].page_size_bytes for n in idx_names}
     if len(mla_pages) != 1 or len(idx_pages) != 1:
         return None
     mla_page = mla_pages.pop()
