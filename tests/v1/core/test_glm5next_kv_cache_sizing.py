@@ -25,6 +25,7 @@ Run inside the deployment image:
 
 import pytest
 import torch
+from math import gcd, lcm
 
 from vllm.config import (
     CacheConfig,
@@ -476,3 +477,81 @@ def test_lane_survives_eagle3_hidden_layers():
         assert any(
             any("aux_hidden_state" in n for n in t.shared_by) for t in mla_tensors
         )
+
+
+def test_kpool_tail_admission_bounded_working_set(glm5_lane):
+    """A long chunked prefill must be admittable, and the kpool tail must
+    hold only a handful of real blocks per request at every step.
+
+    Regression guard for the glm53-flash-tp4 prefill->decode stall: with the
+    SlidingWindowManager fallback, the tail's first-chunk allocation demanded
+    cdiv(chunk_tokens, 4) real blocks (~4096 for a 16K chunk) against the
+    ~1865-block pool, so a cold prompt beyond ~7.4K tokens never left the
+    waiting queue. KpoolTailManager null-pads dead positions and keeps only
+    the live window + lookahead span real (~3 blocks).
+    """
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
+    from vllm.v1.core.single_type_kv_cache_manager import KpoolTailManager
+    from vllm.v1.kv_cache_interface import KpoolTailSpec
+    from vllm.v1.request import Request
+
+    vllm_config, _, groups, _ = glm5_lane
+    assert groups is not None
+    worker_cfg = get_kv_cache_config_from_groups(vllm_config, groups, 4 << 30)
+    sched_cfg = generate_scheduler_kv_cache_config([worker_cfg])
+
+    tail_gid = next(
+        i
+        for i, g in enumerate(sched_cfg.kv_cache_groups)
+        if isinstance(g.kv_cache_spec, KpoolTailSpec)
+    )
+    group_bs = [g.kv_cache_spec.block_size for g in sched_cfg.kv_cache_groups]
+    mgr = KVCacheManager(
+        kv_cache_config=sched_cfg,
+        max_model_len=MAX_MODEL_LEN,
+        scheduler_block_size=lcm(*group_bs),
+        hash_block_size=gcd(*group_bs),
+        max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+        enable_caching=False,
+        use_eagle=True,
+        num_prefill_lookahead=7,
+    )
+    tail_mgr = mgr.coordinator.single_type_managers[tail_gid]
+    assert isinstance(tail_mgr, KpoolTailManager)
+
+    req = Request(
+        request_id="tail-40k",
+        prompt_token_ids=[0] * 40_000,
+        sampling_params=SamplingParams(max_tokens=4, temperature=0),
+        pooling_params=None,
+    )
+    free0 = mgr.block_pool.get_num_free_blocks()
+    # Chunked prefill (16K-token chunks) + a few decode steps.
+    while req.num_computed_tokens < 40_000:
+        num_new = min(16_384, 40_000 - req.num_computed_tokens)
+        blocks = mgr.allocate_slots(
+            req,
+            num_new,
+            num_lookahead_tokens=7,
+            full_sequence_must_fit=(req.num_computed_tokens == 0),
+            has_scheduled_reqs=False,
+        )
+        assert blocks is not None, (
+            f"allocation stalled at computed={req.num_computed_tokens}"
+        )
+        req.num_computed_tokens += num_new
+        real = sum(not b.is_null for b in tail_mgr.req_to_blocks[req.request_id])
+        assert real <= 8, f"tail holds {real} real blocks at {req.num_computed_tokens}"
+    for _ in range(3):
+        blocks = mgr.allocate_slots(
+            req, 1, num_lookahead_tokens=7, has_scheduled_reqs=False
+        )
+        assert blocks is not None, "decode allocation stalled"
+        req.num_computed_tokens += 1
+        real = sum(not b.is_null for b in tail_mgr.req_to_blocks[req.request_id])
+        assert real <= 8, f"tail holds {real} real blocks during decode"
+    used = free0 - mgr.block_pool.get_num_free_blocks()
+    assert used < 300, f"40K prompt consumed {used} blocks"
+
