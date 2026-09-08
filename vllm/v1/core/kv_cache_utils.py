@@ -2244,6 +2244,14 @@ def get_kv_cache_groups(
         # group_and_unify_kv_cache_specs, which would unify the indexer onto
         # the MLA page, and the generic uniform-page path, which cannot serve
         # this model.
+        logger.warning(
+            "GLM5 LANE groups: %s",
+            [
+                (len(g.layer_names), type(g.kv_cache_spec).__name__,
+                 g.layer_names[0] if g.layer_names else "-")
+                for g in glm5_groups
+            ],
+        )
         return glm5_groups
     elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
         # All layers need the same number of token slots (e.g., all layers are
