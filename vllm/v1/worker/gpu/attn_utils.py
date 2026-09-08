@@ -139,17 +139,6 @@ def init_attn_backend(
                 group_map[key].layer_names.append(layer_name)
 
         attn_groups.append([group_map[key] for key in group_order])
-        # TEMP diagnostic: which layers resolved to backends per KV group (V1
-        # runner path, init_attn_backend).
-        import logging
-        logging.getLogger("vllm.glm5_diag").warning(
-            "GLM5 V1 GROUP gid=%d n_layer_names=%d n_resolved=%d spec=%s layer0=%s",
-            kv_cache_group_id,
-            len(layer_names),
-            len(group_map),
-            type(kv_cache_group_spec.kv_cache_spec).__name__,
-            layer_names[0] if layer_names else "-",
-        )
 
     # Phase 2: pick a kernel block size per kv cache group that is supported
     # by all backends within that group.

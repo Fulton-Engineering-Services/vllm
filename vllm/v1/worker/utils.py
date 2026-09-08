@@ -168,17 +168,16 @@ class KVBlockZeroer:
                 el = kv.element_size()
                 block_stride_bytes = kv.stride(block_dim) * el
                 assert block_stride_bytes % 4 == 0
-                # TEMP diagnostic for the GLM-5.3 kpool indexer boot crash.
-                if kv.shape[block_dim] % ratio != 0:
-                    raise AssertionError(
-                        f"KVBlockZeroer: layer={layer_name} "
-                        f"group={group.kv_cache_group_id} "
-                        f"spec={type(spec).__name__} spec.block_size={spec.block_size} "
-                        f"storage_block_size={getattr(spec, 'storage_block_size', '-')} "
-                        f"kernel_bs={kernel_bs} ratio={ratio} "
-                        f"kv.shape={tuple(kv.shape)} kv.stride={tuple(kv.stride())} "
-                        f"block_dim={block_dim} kv.shape[block_dim]={kv.shape[block_dim]}"
-                    )
+                assert kv.shape[block_dim] % ratio == 0, (
+                    f"KVBlockZeroer: layer={layer_name} "
+                    f"group={group.kv_cache_group_id} "
+                    f"spec={type(spec).__name__} spec.block_size={spec.block_size} "
+                    f"storage_block_size={getattr(spec, 'storage_block_size', '-')} "
+                    f"kernel_bs={kernel_bs} ratio={ratio} "
+                    f"kv.shape={tuple(kv.shape)} kv.stride={tuple(kv.stride())} "
+                    f"block_dim={block_dim} "
+                    f"kv.shape[block_dim]={kv.shape[block_dim]}"
+                )
                 outer_dims = [
                     d
                     for d in range(block_dim)
@@ -409,14 +408,6 @@ def prepare_kernel_block_sizes(
             group_backends = [g.backend for g in attn_groups[kv_cache_gid]]
             selected_kernel_size = select_common_block_size(
                 kv_manager_block_size, group_backends
-            )
-            # TEMP diagnostic for the GLM-5.3 indexer kernel-block selection.
-            logger.warning(
-                "GLM5 KBS gid=%d manager_block=%d backends=%s selected=%d",
-                kv_cache_gid,
-                kv_manager_block_size,
-                [b.__name__ for b in group_backends],
-                selected_kernel_size,
             )
             kernel_block_sizes.append(selected_kernel_size)
         elif isinstance(kv_cache_spec, MambaSpec):
