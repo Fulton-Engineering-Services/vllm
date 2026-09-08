@@ -1407,7 +1407,11 @@ def _get_kv_cache_config_packed_hybrid(
     return num_blocks, kv_cache_tensors
 
 
-
+def get_kv_cache_config_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
     """
     Generate the KV cache configuration from the KV cache groups and spec
     of each layer.
