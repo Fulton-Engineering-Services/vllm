@@ -124,27 +124,35 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         from dataclasses import replace
 
         spec = super().get_kv_cache_spec(vllm_config)
-        # ``compress_ratio = index_kpool`` shrinks the cache allocation to
-        # ``storage_block_size = block_size // kpool`` (day-0 semantics). The
-        # indexer block is then virtually split to the DeepGEMM kernel block
-        # (``get_supported_kernel_block_sizes() == [64]``), so the runtime
-        # builder sees ``block_kv = kernel_block_size // compress_ratio``. For
-        # that to stay in DeepGEMM's legal {32, 64}, the spec's block_size must
-        # be the kernel block (64) * kpool, i.e. 256 for kpool=4 -- NOT the
-        # model-wide 2304. Setting block_size=2304 made block_kv=16 and crashed
-        # the DeepGEMM paged-MQA assert (csrc/apis/attention.hpp:262).
+        # The kpool indexer must present block_size == the model-wide scheduler
+        # block (2304) to the KV manager so its pool accounting is uniform with
+        # the co-located MLA; pinning it to kernel_tile*kpool (256) made the
+        # manager allocate cdiv(tokens,256) blocks from the 2304-token pool,
+        # stalling admission on any long request. DeepGEMM still needs
+        # storage_block_size (= block_size // compress_ratio) in {32, 64}, so
+        # set compress_ratio = block_size // 64 (36) to keep storage_block_size
+        # = 64. The page is unchanged (page_size_bytes depends on
+        # storage_block_size, not block_size). The kpool compression is carried
+        # independently by tokens_per_state (= index_kpool), set by the base
+        # indexer; the runtime kernel-block split (supported [256]) divides the
+        # 2304 manager block into 256-token kernel blocks for the kernel.
         assert isinstance(spec, MLAAttentionSpec)
-        spec = replace(spec, compress_ratio=self._index_kpool)
-
-        # DeepGEMM paged-MQA takes block_kv in {32, 64}. Pin the spec block to
-        # the largest kernel tile * kpool so the runtime's kernel-block split
-        # yields block_kv == 64.
-        kernel_block = max(PAGED_MQA_PAGE_SIZES)  # 64
-        spec = replace(spec, block_size=kernel_block * self._index_kpool)
-        storage_block_size = spec.block_size // self._index_kpool
-        assert storage_block_size in PAGED_MQA_PAGE_SIZES, (
-            f"Glm5NextIndexerCache: storage_block_size={storage_block_size} "
-            f"must be a DeepGEMM page tile {PAGED_MQA_PAGE_SIZES}"
+        block_size = spec.block_size  # model-wide scheduler block (2304)
+        kernel_tile = max(PAGED_MQA_PAGE_SIZES)  # 64 (DeepGEMM block_kv)
+        assert block_size % kernel_tile == 0, (
+            f"Glm5NextIndexerCache: block_size={block_size} must be a multiple "
+            f"of the DeepGEMM tile {kernel_tile}"
+        )
+        storage_block_size = block_size // (block_size // kernel_tile)
+        spec = replace(
+            spec,
+            block_size=block_size,
+            compress_ratio=block_size // kernel_tile,
+            tokens_per_state=self._index_kpool,
+        )
+        assert spec.storage_block_size == kernel_tile, (
+            f"Glm5NextIndexerCache: storage_block_size={spec.storage_block_size} "
+            f"must be the DeepGEMM tile {kernel_tile} for block_kv"
         )
         return spec
 
