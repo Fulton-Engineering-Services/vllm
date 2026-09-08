@@ -1380,11 +1380,11 @@ def _get_kv_cache_config_packed_hybrid(
             layer_kernel_page = spec.page_size_bytes
         else:
             blocks_per_mb = manager_block_size // spec.block_size
-            layer_kernel_page = spec.page_size_bytes // blocks_per_mb
-            assert blocks_per_mb * layer_kernel_page == spec.page_size_bytes, (
-                f"Layer page {spec.page_size_bytes} does not divide evenly "
-                f"across {blocks_per_mb} kernel blocks"
-            )
+            # The group's per-manager-block byte footprint is one full spec page
+            # (the spec's page already covers one block_size of storage). Pack the
+            # whole page contiguously; the worker reshapes it into blocks_per_mb
+            # kernel blocks via get_kv_cache_shape.
+            layer_kernel_page = spec.page_size_bytes
         for layer_name in group.layer_names:
             layer_offset[layer_name] = block_stride
             packed[(block_stride, blocks_per_mb)].append(layer_name)
