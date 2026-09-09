@@ -15,6 +15,7 @@ from vllm.model_executor.models.qwen3_dflash import (
     _dflash_layer_causal,
     _get_dflash_fc_input_size,
     dflash_has_any_non_causal,
+    dflash_target_rope_is_neox_style,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
@@ -113,3 +114,41 @@ def test_eagle_aux_layers_preserves_legacy_layer_ids(config_name):
     assert get_eagle3_aux_layers_from_config(vllm_config.speculative_config) == tuple(
         layer_ids
     )
+
+
+def test_target_rope_style_skips_auxiliary_ropes():
+    """A NoPE target must not lend an auxiliary rope's style to the drafter.
+
+    GLM-5.3's MLA attention is NoPE (rotary_emb=None) but carries a sparse
+    indexer rope (indexer_rope_emb, is_neox_style=False for the deployed
+    checkpoint). The drafter was distilled against the checkpoint default
+    (neox style); copying the indexer's interleaved style silently collapses
+    speculative acceptance. The walk must only consult token-mixing attention
+    ropes.
+    """
+    import torch.nn as nn
+
+    class Rope(nn.Module):
+        def __init__(self, is_neox_style: bool):
+            super().__init__()
+            self.is_neox_style = is_neox_style
+
+    class Attn(nn.Module):
+        def __init__(self, rotary_emb, indexer_rope_emb=None):
+            super().__init__()
+            self.rotary_emb = rotary_emb
+            if indexer_rope_emb is not None:
+                self.indexer_rope_emb = indexer_rope_emb
+
+    class LM(nn.Module):
+        def __init__(self, attn):
+            super().__init__()
+            self.attn = attn
+
+    # NoPE target + interleaved indexer rope -> None (keep checkpoint default).
+    assert dflash_target_rope_is_neox_style(LM(Attn(None, Rope(False)))) is None
+    # Real attention ropes are still picked up, both styles.
+    assert dflash_target_rope_is_neox_style(LM(Attn(Rope(True)))) is True
+    assert dflash_target_rope_is_neox_style(LM(Attn(Rope(False)))) is False
+    # No rope at all -> None.
+    assert dflash_target_rope_is_neox_style(LM(Attn(None))) is None

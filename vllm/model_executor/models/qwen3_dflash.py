@@ -82,6 +82,12 @@ def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
     does, and a mismatch is silent — acceptance collapses but nothing errors and
     the output stays correct. Draft checkpoints do not carry this, so take it
     from the target. None if the target uses no RoPE.
+
+    Only a token-mixing attention rope (an attention module's ``rotary_emb``)
+    qualifies. On NoPE targets (e.g. GLM-5.3's MLA, ``rotary_emb=None``) the
+    first module carrying ``is_neox_style`` can be an auxiliary rope such as the
+    sparse indexer's, whose pairing the drafter was NOT distilled against —
+    copying it scrambles every draft Q/K rotation while shapes stay valid.
     """
     language_model = (
         target_model.get_language_model()
@@ -89,7 +95,7 @@ def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
         else target_model
     )
     for module in language_model.modules():
-        style = getattr(module, "is_neox_style", None)
+        style = getattr(getattr(module, "rotary_emb", None), "is_neox_style", None)
         if isinstance(style, bool):
             return style
     return None
