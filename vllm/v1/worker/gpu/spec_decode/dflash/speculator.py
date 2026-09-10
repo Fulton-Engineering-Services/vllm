@@ -99,6 +99,24 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
 
+        # draft_tensor_parallel_size=1: eagerly create the per-rank singleton
+        # TP groups. torch.distributed.new_group is collective over ALL ranks
+        # even for single-rank groups, so this must happen at a point every
+        # rank reaches symmetrically — the speculator ctor qualifies.
+        self.draft_tp1 = (
+            self.speculative_config.draft_parallel_config is not None
+            and self.speculative_config.draft_parallel_config.tensor_parallel_size == 1
+        )
+        if self.draft_tp1:
+            from vllm.distributed import get_or_init_singleton_tp_group
+
+            get_or_init_singleton_tp_group()
+            logger.info(
+                "%s drafter will be built replicated (draft_tensor_parallel_size=1); "
+                "no drafter-layer collectives.",
+                self._speculator_name,
+            )
+
     @property
     def attn_vllm_config(self) -> VllmConfig:
         # The draft's attention differs from the target's in causality.

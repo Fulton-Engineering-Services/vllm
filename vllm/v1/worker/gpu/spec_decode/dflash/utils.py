@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from contextlib import nullcontext
+
 import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
@@ -21,6 +23,14 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
+    # draft_tensor_parallel_size=1: build the drafter fully replicated. The
+    # singleton-group swap makes every parallel layer store tp_size=1 at
+    # construction time, so no drafter layer issues collectives at forward.
+    draft_parallel_config = speculative_config.draft_parallel_config
+    draft_tp1 = (
+        draft_parallel_config is not None
+        and draft_parallel_config.tensor_parallel_size == 1
+    )
     # The drafter must rotate Q/K the way its target does. Take that from the
     # built target before super() constructs the draft.
     is_neox_style = dflash_target_rope_is_neox_style(target_model)
@@ -43,11 +53,29 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             if speculative_config.kv_cache_dtype is not None
             else vllm_config.cache_config
         ),
+        parallel_config=(
+            replace(
+                draft_parallel_config,
+                rank=vllm_config.parallel_config.rank,
+            )
+            if draft_tp1
+            else vllm_config.parallel_config
+        ),
     )
     with set_model_tag("dflash_head"):
-        dflash_model = get_model(
-            vllm_config=draft_vllm_config, model_config=draft_model_config
-        )
+        if draft_tp1:
+            from vllm.distributed import (
+                get_or_init_singleton_tp_group,
+                swapped_tp_group,
+            )
+
+            tp_ctx = swapped_tp_group(get_or_init_singleton_tp_group())
+        else:
+            tp_ctx = nullcontext()
+        with tp_ctx:
+            dflash_model = get_model(
+                vllm_config=draft_vllm_config, model_config=draft_model_config
+            )
 
     target_language_model = (
         target_model.get_language_model()

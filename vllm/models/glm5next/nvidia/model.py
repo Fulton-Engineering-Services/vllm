@@ -11,9 +11,11 @@ from torch import nn
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
+    get_or_init_singleton_tp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    swapped_tp_group,
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
@@ -658,12 +660,31 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # Full-MLA config (no kpool sparse indexer): no topk buffer.
             topk_indices_buffer = None
 
+        replicated_embed = os.environ.get("GLM53_REPLICATED_EMBED") == "1"
+        if replicated_embed:
+            # new_group is collective over ALL ranks — the singleton group must
+            # be created outside the PP-first-rank guard below or PP>1 hangs.
+            singleton_tp = get_or_init_singleton_tp_group()
+
         if get_pp_group().is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                prefix=f"{prefix}.embed_tokens",
-            )
+            if replicated_embed:
+                # Replicated embedding: built under the per-rank singleton TP
+                # group so it stores tp_size=1 — no vocab sharding and no
+                # forward all-reduce. The DFlash drafter shares this table
+                # (load_dflash_model), so this removes both the target's and
+                # the draft's embedding all-reduce. ~0.95 GiB/rank extra.
+                with swapped_tp_group(singleton_tp):
+                    self.embed_tokens = VocabParallelEmbedding(
+                        config.vocab_size,
+                        config.hidden_size,
+                        prefix=f"{prefix}.embed_tokens",
+                    )
+            else:
+                self.embed_tokens = VocabParallelEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    prefix=f"{prefix}.embed_tokens",
+                )
         else:
             self.embed_tokens = PPMissingLayer()
 

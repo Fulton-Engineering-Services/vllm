@@ -241,6 +241,37 @@ def test_drafter_standalone_when_page_does_not_fit():
     assert all(s.page_size_bytes != mla_page_built for s in inner.values())
 
 
+def test_drafter_tp1_quadrupled_page_goes_standalone():
+    """A draft_tensor_parallel_size=1 drafter holds all KV heads on every
+    rank, quadrupling per-token bytes vs the TP4-sharded drafter. The builder
+    must still accept it — the quadrupled page no longer exact-fits the MLA
+    page, so it lands on the standalone branch."""
+    # TP4-sharded exact-fit geometry: 1 x 288 x 2 x bf16 = 1152 B/token.
+    # TP1 replicated: 4x heads -> 4608 B/token -> fit_block 288, whose
+    # % 64 != 0 fails the exact-fit conditions -> STANDALONE.
+    drafter = SlidingWindowSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=4,
+        head_size=288,
+        dtype=torch.bfloat16,
+        sliding_window=64,
+    )
+    specs = _glm5_specs()
+    specs["d.draft"] = drafter
+
+    groups = try_build_kv_cache_groups(_vllm_config(), specs)
+    assert groups is not None
+    draft_group = groups[-1]
+    assert isinstance(draft_group.kv_cache_spec, UniformTypeKVCacheSpecs)
+    inner = draft_group.kv_cache_spec.kv_cache_specs
+    assert all(s.block_size == BLOCK_SIZE for s in inner.values())
+    assert all(s.page_size_padded is None for s in inner.values())
+    mla_page_built = next(
+        iter(cast_spec(groups[0]).kv_cache_specs.values())
+    ).page_size_bytes
+    assert all(s.page_size_bytes != mla_page_built for s in inner.values())
+
+
 def test_drafter_group_appended_last_keeps_group_ids_stable():
     drafter = SlidingWindowSpec(
         block_size=BLOCK_SIZE,

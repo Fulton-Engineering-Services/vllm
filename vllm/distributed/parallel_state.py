@@ -1391,6 +1391,54 @@ def get_tp_group() -> GroupCoordinator:
     return _TP
 
 
+_SINGLETON_TP: GroupCoordinator | None = None
+
+
+def get_or_init_singleton_tp_group() -> GroupCoordinator:
+    """Per-rank singleton TP group for building collective-free modules.
+
+    Modules built while this group is the active TP group store tp_size=1,
+    so their parallel layers (VocabParallelEmbedding, RowParallelLinear, ...)
+    skip every all-reduce/all-gather at forward time. Used for replicated
+    drafters (draft_tensor_parallel_size=1) and replicated embeddings.
+
+    torch.distributed.new_group is collective over ALL ranks even for a
+    single-rank group, so every rank must participate in creating every
+    singleton group; each rank keeps only its own. Call this at a point all
+    ranks reach symmetrically (e.g. speculator/model __init__).
+    """
+    global _SINGLETON_TP
+    if _SINGLETON_TP is None:
+        world = get_world_group()
+        _SINGLETON_TP = init_model_parallel_group(
+            [[r] for r in range(world.world_size)],
+            world.local_rank,
+            world.torch_distributed_backend,
+            use_device_communicator=False,
+            group_name="singleton_tp",
+        )
+    return _SINGLETON_TP
+
+
+@contextmanager
+def swapped_tp_group(group: GroupCoordinator):
+    """Point the active TP group at `group` for the duration of the block.
+
+    Construction-time only: parallel layers capture get_tp_group() state in
+    __init__. Never wrap forward passes — runtime collectives issued through
+    get_tp_group() (e.g. a shared TP lm_head's all-gather) must keep using
+    the real group.
+    """
+    global _TP
+    assert _TP is not None, "tensor model parallel group is not initialized"
+    saved = _TP
+    _TP = group
+    try:
+        yield
+    finally:
+        _TP = saved
+
+
 _DCP: GroupCoordinator | None = None
 
 
@@ -2088,6 +2136,11 @@ def destroy_model_parallel():
     if _TP:
         _TP.destroy()
     _TP = None
+
+    global _SINGLETON_TP
+    if _SINGLETON_TP:
+        _SINGLETON_TP.destroy()
+    _SINGLETON_TP = None
 
     global _DCP
     if _DCP:
