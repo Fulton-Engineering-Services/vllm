@@ -446,7 +446,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             ):
                 return (
                     False,
-                    "MXFP4 W4A8 requires hidden size divisible by 256 and "
+                    "MXFP4 W4A8 requires hidden size divisible by 256 and "  # noqa: ISC004
                     "per-rank intermediate size divisible by 32",
                 )
         return mk.FusedMoEExperts.is_supported_config(
