@@ -17,6 +17,10 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from vllm.config.model import ModelConfig, get_hf_text_config
+from vllm.transformers_utils.configs.glm5_next import (
+    Glm5NextConfig,
+    Glm5NextTextConfig,
+)
 from vllm.transformers_utils.model_arch_config_convertor import (
     MODEL_ARCH_CONFIG_CONVERTORS,
     ModelArchConfigConvertorBase,
@@ -28,10 +32,12 @@ from vllm.v1.metrics.perf import (
     ExecutionContext,
     FfnMetrics,
     InvalidComponent,
+    KdaMetrics,
     MLAAttentionMetrics,
     ModelMetrics,
     ParsedArgs,
     UnembedMetrics,
+    _resolve_compressed_tensors_byte_size,
 )
 
 
@@ -1336,3 +1342,259 @@ def test_mla_attention_scaling_with_layers():
     assert double_metrics.get_num_flops(ctx) == 2 * base_metrics.get_num_flops(ctx)
     assert double_metrics.get_read_bytes(ctx) == 2 * base_metrics.get_read_bytes(ctx)
     assert double_metrics.get_write_bytes(ctx) == 2 * base_metrics.get_write_bytes(ctx)
+
+
+#### GLM-5.3-Flash (glm5next) regression tests ####
+
+
+def _glm5next_config() -> Glm5NextConfig:
+    """GLM-5.3-Flash-shaped config: 45 layers, 11 NoPE DSA/MLA + 34 KDA,
+    3 dense + 42 MoE FFN layers, 288 experts with top-8 routing."""
+    layer_types = [
+        "deepseek_sparse_attention" if (i + 1) % 4 == 0 else "linear_attention"
+        for i in range(45)
+    ]
+    mlp_layer_types = ["dense"] * 3 + ["sparse"] * 42
+    text_config = Glm5NextTextConfig(
+        hidden_size=4096,
+        intermediate_size=12288,
+        num_hidden_layers=45,
+        num_attention_heads=64,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_nope_head_dim=256,
+        qk_rope_head_dim=0,
+        v_head_dim=256,
+        n_routed_experts=288,
+        num_experts_per_token=8,
+        n_shared_experts=1,
+        moe_intermediate_size=2048,
+        first_k_dense_replace=3,
+        moe_layer_freq=1,
+        layer_types=layer_types,
+        mlp_layer_types=mlp_layer_types,
+        linear_head_dim=128,
+        linear_num_heads=64,
+        linear_conv_kernel_dim=4,
+    )
+    return Glm5NextConfig(text_config=text_config)
+
+
+def test_glm5next_all_components_instantiate():
+    """GLM-5.3-Flash must instantiate mla_attn/kda/ffn/unembed. Regression
+    test for the silently zeroed MFU metrics where every heavyweight
+    component failed to parse and only unembed survived."""
+    vllm_config = create_mock_vllm_config(_glm5next_config())
+    model_metrics = ModelMetrics(vllm_config)
+
+    component_types = {m.component_type() for m in model_metrics.metrics}
+    assert {"mla_attn", "kda", "ffn", "unembed"} <= component_types
+    assert "attn" not in component_types
+    assert "mamba" not in component_types
+
+    ctx = ExecutionContext.from_single_request(
+        num_tokens=8, context_len=512, is_prefill=False
+    )
+    breakdown = model_metrics.get_num_flops_breakdown(ctx)
+    assert breakdown["mla_attn.out_proj"] > 0
+    assert breakdown["kda.kda_out_proj"] > 0
+    assert breakdown["ffn.routed_ffn"] > 0
+    assert breakdown["unembed.unembed"] > 0
+
+
+def test_glm5next_ffn_layer_counts():
+    """FFN layer counts must come from mlp_layer_types for glm5next-style
+    configs whose layers_block_type never contains "moe"/"mlp" entries."""
+    vllm_config = create_mock_vllm_config(_glm5next_config())
+    metrics = FfnMetrics.from_vllm_config(vllm_config)
+
+    assert metrics.num_moe_layers_from_block_type == 42
+    assert metrics.num_dense_ffn_layers_from_block_type == 3
+
+    ctx = ExecutionContext.from_single_request(
+        num_tokens=8, context_len=100, is_prefill=False
+    )
+    flops = metrics.get_num_flops_breakdown(ctx, per_gpu=False)
+    # routed: 2 * 3 GEMMs * D * MI * (T * top_k) * L_moe
+    assert flops["routed_ffn"] == 2 * 3 * 4096 * 2048 * (8 * 8) * 42
+    # dense: 2 * 3 GEMMs * D * DI * T * L_dense
+    assert flops["dense_ffn"] == 2 * 3 * 4096 * 12288 * 8 * 3
+    # shared: 2 * 3 GEMMs * D * MI * S * T * L_moe
+    assert flops["shared_ffn"] == 2 * 3 * 4096 * 2048 * 1 * 8 * 42
+
+
+def test_mla_nope_qk_rope_zero_validates():
+    """NoPE MLA (qk_rope_head_dim=0) must validate — previously raised
+    ValidationError -> InvalidComponent, skipping all MLA layers."""
+    vllm_config = create_mock_vllm_config(_glm5next_config())
+    metrics = MLAAttentionMetrics.from_vllm_config(vllm_config)
+    assert metrics.qk_rope_head_dim == 0
+
+    ctx = ExecutionContext.from_single_request(
+        num_tokens=1, context_len=1024, is_prefill=False
+    )
+    write = metrics.get_write_bytes_breakdown(ctx, per_gpu=False)
+    # kv_cache = T * (kv_lora_rank + 0) * cache_bytes * L
+    assert write["kv_cache"] == 1 * 512 * 2 * 11
+
+
+def test_mla_attention_layer_count_override():
+    """MLA metrics must use the attention-layer count from layers_block_type
+    (11 of 45 for GLM-5.3-Flash), not num_hidden_layers."""
+    vllm_config = create_mock_vllm_config(_glm5next_config())
+    metrics = MLAAttentionMetrics.from_vllm_config(vllm_config)
+
+    assert metrics.num_hidden_layers == 45
+    assert metrics.num_attention_layers == 11
+
+    ctx = ExecutionContext.from_single_request(
+        num_tokens=8, context_len=512, is_prefill=True
+    )
+    flops = metrics.get_num_flops_breakdown(ctx, per_gpu=False)
+    # out_proj = 2 * T * q * v_head_dim * D * L with L = 11
+    assert flops["out_proj"] == 2 * 8 * 64 * 256 * 4096 * 11
+
+
+def _mock_cached_scheduler_output(
+    num_computed: int, num_scheduled: int
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["req0"],
+            num_computed_tokens=[num_computed],
+        ),
+        num_scheduled_tokens={"req0": num_scheduled},
+    )
+
+
+def test_spec_decode_cached_reqs_classified_decode(monkeypatch):
+    """With spec decode enabled, multi-token steps for cached requests are
+    verify (decode) steps, not prefill chunks (chunked prefill is disabled
+    under spec decode). Regression test for DFlash2 decode steps (1+7
+    tokens) being misclassified as prefill."""
+    monkeypatch.setenv("VLLM_DEBUG_MFU_METRICS", "1")
+    vllm_config = create_mock_vllm_config(_glm5next_config())
+    vllm_config.speculative_config = SimpleNamespace(method="dflash")
+    model_metrics = ModelMetrics(vllm_config)
+
+    scheduler_output = _mock_cached_scheduler_output(100, 8)
+    stats = model_metrics.get_step_perf_stats_per_gpu(scheduler_output)
+
+    assert stats.debug_stats is not None
+    assert stats.debug_stats.num_prefill_requests == 0
+    assert stats.debug_stats.num_decode_requests == 1
+    assert stats.debug_stats.context_breakdown["decode_num_tokens"] == 8
+    # All 8 verify tokens require logits (num_prefill_requests(0) + 8)
+    unembed_flops = stats.debug_stats.num_flops_per_gpu_breakdown[
+        "unembed.unembed"
+    ]
+    assert unembed_flops == 2 * 8 * 4096 * 154880
+
+
+def test_chunked_prefill_still_prefill_without_spec_decode(monkeypatch):
+    """Without spec decode, a multi-token cached step is chunked prefill."""
+    monkeypatch.setenv("VLLM_DEBUG_MFU_METRICS", "1")
+    vllm_config = create_mock_vllm_config(_glm5next_config())
+    model_metrics = ModelMetrics(vllm_config)
+
+    scheduler_output = _mock_cached_scheduler_output(100, 8)
+    stats = model_metrics.get_step_perf_stats_per_gpu(scheduler_output)
+
+    assert stats.debug_stats is not None
+    assert stats.debug_stats.num_prefill_requests == 1
+    assert stats.debug_stats.num_decode_requests == 0
+
+
+def test_kda_metrics_scaling():
+    """KDA metrics: layer count from layers_block_type, token scaling, and
+    TP sharding along linear attention heads."""
+    vllm_config = create_mock_vllm_config(
+        _glm5next_config(), tensor_parallel_size=4
+    )
+    metrics = KdaMetrics.from_vllm_config(vllm_config)
+
+    assert metrics.num_kda_layers == 34
+    assert metrics.linear_num_heads == 64
+    assert metrics.linear_head_dim == 128
+
+    ctx1 = ExecutionContext.from_single_request(
+        num_tokens=4, context_len=100, is_prefill=False
+    )
+    ctx2 = ExecutionContext.from_single_request(
+        num_tokens=8, context_len=100, is_prefill=False
+    )
+    assert metrics.get_num_flops(ctx2) == 2 * metrics.get_num_flops(ctx1)
+
+    T, D, hd, L = 4, 4096, 128, 34
+    global_ = metrics.get_num_flops_breakdown(ctx1, per_gpu=False)
+    in_out_global = 3 * 64 * hd + 64 + 2 * hd
+    assert global_["kda_in_proj"] == 2 * T * D * in_out_global * L
+
+    per_gpu = metrics.get_num_flops_breakdown(ctx1, per_gpu=True)
+    nh_local = 64 // 4
+    in_out_local = 3 * nh_local * hd + nh_local + 2 * hd
+    assert per_gpu["kda_in_proj"] == 2 * T * D * in_out_local * L
+
+    # GDN state read/write uses the ssm state byte size (fp32 default)
+    read = metrics.get_read_bytes_breakdown(ctx1, per_gpu=False)
+    assert read["kda_state_read"] == 4 * 64 * hd * hd * 4 * L
+
+
+def _mock_redhatai_quant_config() -> SimpleNamespace:
+    """Compressed-tensors config shaped like the RedHatAI
+    GLM-5.3-Flash-NVFP4 checkpoint: only routed experts on layers 3-44 are
+    NVFP4; attention/KDA projections and lm_head are in the ignore list."""
+    return SimpleNamespace(
+        ignore=[
+            "model.language_model.layers.0.self_attn.q_proj",
+            "model.language_model.layers.3.self_attn.q_b_proj",
+            "lm_head",
+        ],
+        target_scheme_map={
+            "re:.*\\.layers\\.(?:[3-9]|[1-3][0-9]|4[0-4])"
+            "\\.mlp\\.experts\\..*(gate|up|down)_proj$": {
+                "weights": SimpleNamespace(num_bits=4),
+            },
+            "re:.*\\.layers\\.45\\.mlp\\.experts\\.\\d+"
+            "\\.(gate_proj|up_proj|down_proj)$": {
+                "weights": SimpleNamespace(num_bits=8),
+            },
+        },
+    )
+
+
+def test_compressed_tensors_per_component_byte_size():
+    """Per-component weight byte sizes from a compressed-tensors config:
+    ignored layers keep dtype bytes; group-matched layers use num_bits."""
+    quant_config = _mock_redhatai_quant_config()
+
+    assert _resolve_compressed_tensors_byte_size(quant_config, "attn", 2.0) == 2.0
+    assert _resolve_compressed_tensors_byte_size(quant_config, "kda", 2.0) == 2.0
+    assert _resolve_compressed_tensors_byte_size(quant_config, "unembed", 2.0) == 2.0
+    assert _resolve_compressed_tensors_byte_size(quant_config, "ffn", 2.0) == 0.5
+
+
+def test_glm5next_compressed_tensors_weight_sizes():
+    """End-to-end: quant parsers apply per-component byte sizes so the
+    unquantized MLA/KDA projections of mixed-precision checkpoints are not
+    undercounted 4x in read-bytes estimates."""
+    quant_config = SimpleNamespace(
+        get_name=lambda: "compressed-tensors",
+        **vars(_mock_redhatai_quant_config()),
+    )
+    vllm_config = create_mock_vllm_config(
+        _glm5next_config(), quant_config=quant_config
+    )
+
+    mla = MLAAttentionMetrics.from_vllm_config(vllm_config)
+    assert mla.weight_byte_size == 2.0
+
+    kda = KdaMetrics.from_vllm_config(vllm_config)
+    assert kda.weight_byte_size == 2.0
+
+    ffn = FfnMetrics.from_vllm_config(vllm_config)
+    assert ffn.weight_byte_size == 0.5
+
+    unembed = UnembedMetrics.from_vllm_config(vllm_config)
+    assert unembed.weight_byte_size == 2.0

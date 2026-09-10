@@ -7,6 +7,7 @@ to help derive MFU (Model Flops Utilization) stats for a running model.
 """
 
 import json
+import re
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
@@ -184,6 +185,76 @@ def _compute_modelopt_mixed_component_byte_sizes(
             component_sizes[component] = default_byte_size
 
     return component_sizes
+
+
+# Sample module names (both checkpoint and vLLM-mapped namespaces) used to
+# probe which compressed-tensors config_group / ignore entry applies to a
+# component. Only used by _resolve_compressed_tensors_byte_size.
+_COMPRESSED_TENSORS_COMPONENT_SAMPLES: dict[str, list[str]] = {
+    "attn": [
+        "language_model.model.layers.3.self_attn.q_b_proj",
+        "model.language_model.layers.3.self_attn.q_b_proj",
+        "model.layers.3.self_attn.q_proj",
+    ],
+    "ffn": [
+        "language_model.model.layers.4.mlp.experts.0.gate_proj",
+        "model.language_model.layers.4.mlp.experts.0.gate_proj",
+        "model.layers.4.mlp.experts.0.gate_proj",
+    ],
+    "kda": [
+        "language_model.model.layers.0.self_attn.q_proj",
+        "model.language_model.layers.0.self_attn.q_proj",
+        "model.layers.0.self_attn.q_proj",
+    ],
+    "unembed": ["language_model.lm_head", "lm_head"],
+}
+
+
+def _ct_target_matches(layer_name: str, target: str) -> bool:
+    """Match a layer name against a compressed-tensors target/ignore entry."""
+    if target.startswith("re:"):
+        try:
+            return re.match(target[3:], layer_name) is not None
+        except re.error:
+            return False
+    return target == layer_name
+
+
+def _resolve_compressed_tensors_byte_size(
+    quant_config: object, component: str, default_byte_size: float
+) -> float:
+    """
+    Resolve the effective weight byte size for a component from a
+    compressed-tensors quant config. Layers matched by the checkpoint's
+    ignore list (e.g. the attention/linear-attention projections of
+    mixed-precision checkpoints such as GLM-5.3-Flash-NVFP4) keep the
+    dtype-based size; layers matched by a config_group target use that
+    group's weights.num_bits.
+    """
+    fallback = _QUANT_WEIGHT_BYTE_SIZE.get("compressed-tensors", default_byte_size)
+    samples = _COMPRESSED_TENSORS_COMPONENT_SAMPLES.get(component, [])
+    if not samples:
+        return fallback
+    try:
+        ignore = getattr(quant_config, "ignore", None) or []
+        for sample in samples:
+            if any(_ct_target_matches(sample, entry) for entry in ignore):
+                return default_byte_size
+        scheme_map = getattr(quant_config, "target_scheme_map", None) or {}
+        for target, scheme in scheme_map.items():
+            weights = (scheme or {}).get("weights")
+            num_bits = getattr(weights, "num_bits", None)
+            if num_bits is None:
+                continue
+            if any(_ct_target_matches(sample, target) for sample in samples):
+                return num_bits / 8
+    except Exception:
+        logger.warning(
+            "compressed-tensors byte-size resolution failed for %s; "
+            "falling back to uniform size",
+            component,
+        )
+    return fallback
 
 
 #### Basic Data Types ####
@@ -454,6 +525,27 @@ class BaseConfigParser(Parser):
             args.num_moe_layers_from_block_type = -1
             args.num_dense_ffn_layers_from_block_type = -1
 
+        # glm5next-style configs expose FFN types separately
+        # (mlp_layer_types = ["dense"] * k + ["sparse"] * n) while their
+        # layers_block_type only distinguishes attention from linear attention
+        # and never contains "moe"/"mlp" entries.
+        mlp_layer_types = getattr(hf_config, "mlp_layer_types", None)
+        if mlp_layer_types is not None:
+            args.num_moe_layers_from_block_type = sum(
+                1 for t in mlp_layer_types if t == "sparse"
+            )
+            args.num_dense_ffn_layers_from_block_type = sum(
+                1 for t in mlp_layer_types if t == "dense"
+            )
+        elif (
+            args.num_moe_layers_from_block_type == 0
+            and args.num_dense_ffn_layers_from_block_type == 0
+        ):
+            # No usable layer-type source; let FfnMetrics fall back to
+            # num_moe_layers instead of zeroing out the FFN.
+            args.num_moe_layers_from_block_type = -1
+            args.num_dense_ffn_layers_from_block_type = -1
+
         model_dtype = vllm_config.model_config.dtype
 
         if isinstance(model_dtype, torch.dtype):
@@ -522,6 +614,10 @@ class AttentionQuantizationConfigParser(Parser):
 
         if quant_method == "modelopt_mixed":
             args = self._parse_modelopt_mixed_attn(cfg, args)
+        elif quant_method == "compressed-tensors":
+            args.weight_byte_size = _resolve_compressed_tensors_byte_size(
+                cfg, "attn", args.weight_byte_size
+            )
         elif quant_method in _QUANT_WEIGHT_BYTE_SIZE:
             args.weight_byte_size = _QUANT_WEIGHT_BYTE_SIZE[quant_method]
         else:
@@ -558,6 +654,10 @@ class UnembedQuantizationConfigParser(Parser):
                 cfg, args.weight_byte_size
             )
             args.weight_byte_size = component_sizes.get("unembed", args.weight_byte_size)
+        elif quant_method == "compressed-tensors":
+            args.weight_byte_size = _resolve_compressed_tensors_byte_size(
+                cfg, "unembed", args.weight_byte_size
+            )
         elif quant_method in _QUANT_WEIGHT_BYTE_SIZE:
             args.weight_byte_size = _QUANT_WEIGHT_BYTE_SIZE[quant_method]
         else:
@@ -774,6 +874,7 @@ class MLAAttentionMetrics(ComponentMetrics):
 
     # From BaseConfigParser
     num_hidden_layers: int = Field(..., gt=0)
+    num_attention_layers: int | None = Field(None)
     hidden_size: int = Field(..., gt=0)
     num_attention_heads: int = Field(..., gt=0)
     activation_byte_size: int = Field(..., gt=0)
@@ -786,7 +887,8 @@ class MLAAttentionMetrics(ComponentMetrics):
     # From MLAConfigParser
     kv_lora_rank: int = Field(..., gt=0)
     qk_nope_head_dim: int = Field(..., gt=0)
-    qk_rope_head_dim: int = Field(..., gt=0)
+    # ge=0: NoPE MLA variants (e.g. GLM-5.3-Flash) set qk_rope_head_dim = 0
+    qk_rope_head_dim: int = Field(..., ge=0)
     v_head_dim: int = Field(..., gt=0)
     q_lora_rank: int | None = Field(None)
     cache_byte_size: int = Field(..., gt=0)
@@ -817,7 +919,11 @@ class MLAAttentionMetrics(ComponentMetrics):
         - Attention: Q @ K^T and attn @ V
         - Output: num_heads * v_head_dim -> h
         """
-        L = self.num_hidden_layers
+        L = (
+            self.num_attention_layers
+            if self.num_attention_layers is not None
+            else self.num_hidden_layers
+        )
         D = self.hidden_size
         q = self.num_attention_heads
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -863,7 +969,11 @@ class MLAAttentionMetrics(ComponentMetrics):
         self, ctx: ExecutionContext, per_gpu: bool = True
     ) -> dict[str, int]:
         """Calculate read memory traffic for MLA attention layers."""
-        L = self.num_hidden_layers
+        L = (
+            self.num_attention_layers
+            if self.num_attention_layers is not None
+            else self.num_hidden_layers
+        )
         D = self.hidden_size
         q = self.num_attention_heads
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -937,7 +1047,11 @@ class MLAAttentionMetrics(ComponentMetrics):
         self, ctx: ExecutionContext, per_gpu: bool = True
     ) -> dict[str, int]:
         """Calculate write memory traffic for MLA attention layers."""
-        L = self.num_hidden_layers
+        L = (
+            self.num_attention_layers
+            if self.num_attention_layers is not None
+            else self.num_hidden_layers
+        )
         D = self.hidden_size
         q = self.num_attention_heads
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -1112,6 +1226,10 @@ class FfnQuantizationConfigParser(Parser):
 
         if quant_method == "modelopt_mixed":
             args = self._parse_modelopt_mixed_ffn(cfg, args)
+        elif quant_method == "compressed-tensors":
+            args.weight_byte_size = _resolve_compressed_tensors_byte_size(
+                cfg, "ffn", args.weight_byte_size
+            )
         elif quant_method in _QUANT_WEIGHT_BYTE_SIZE:
             args.weight_byte_size = _QUANT_WEIGHT_BYTE_SIZE[quant_method]
         else:
@@ -1706,22 +1824,7 @@ class MambaConfigParser(Parser):
         # ssm_state_size
         args.ssm_state_size = getattr(cfg, "ssm_state_size", 16)
 
-        # ssm_state_byte_size from cache config if exposed, else fp32 default
-        cache_config = vllm_config.cache_config
-        if (
-            cache_config is not None
-            and hasattr(cache_config, "mamba_ssm_cache_dtype")
-            and cache_config.mamba_ssm_cache_dtype is not None
-        ):
-            mamba_dtype = cache_config.mamba_ssm_cache_dtype
-            if isinstance(mamba_dtype, torch.dtype):
-                args.ssm_state_byte_size = get_dtype_size(mamba_dtype)
-            elif isinstance(mamba_dtype, str) and mamba_dtype in STR_DTYPE_TO_TORCH_DTYPE:
-                args.ssm_state_byte_size = get_dtype_size(STR_DTYPE_TO_TORCH_DTYPE[mamba_dtype])
-            else:
-                args.ssm_state_byte_size = 4  # fp32 fallback
-        else:
-            args.ssm_state_byte_size = 4  # fp32 default
+        args.ssm_state_byte_size = _get_ssm_state_byte_size(vllm_config)
 
         # n_groups
         args.n_groups = getattr(cfg, "n_groups", 1)
@@ -1769,6 +1872,229 @@ class MambaQuantizationConfigParser(Parser):
         return args
 
 
+#### KDA (linear attention) ####
+
+
+def _get_ssm_state_byte_size(vllm_config: VllmConfig) -> int:
+    """SSM/mamba state byte size from cache config if exposed, else fp32."""
+    cache_config = vllm_config.cache_config
+    if (
+        cache_config is not None
+        and hasattr(cache_config, "mamba_ssm_cache_dtype")
+        and cache_config.mamba_ssm_cache_dtype is not None
+    ):
+        mamba_dtype = cache_config.mamba_ssm_cache_dtype
+        if isinstance(mamba_dtype, torch.dtype):
+            return get_dtype_size(mamba_dtype)
+        if isinstance(mamba_dtype, str) and mamba_dtype in STR_DTYPE_TO_TORCH_DTYPE:
+            return get_dtype_size(STR_DTYPE_TO_TORCH_DTYPE[mamba_dtype])
+    return 4  # fp32 default
+
+
+class KdaDetectionParser(Parser):
+    """
+    Prevents KdaMetrics from being instantiated when the model has no
+    "linear_attention" entries in layers_block_type, or when the config
+    lacks the linear attention dims needed for the formulas.
+    """
+
+    def parse(self, args: ParsedArgs, vllm_config: VllmConfig) -> ParsedArgs:
+        hf_config = vllm_config.model_config.hf_text_config
+        if not hasattr(hf_config, "layers_block_type"):
+            raise InvalidComponent("Model has no layers_block_type; no KDA layers")
+
+        block_types = hf_config.layers_block_type
+        if isinstance(block_types, str):
+            block_types = [block_types]
+
+        if not any(bt == "linear_attention" for bt in block_types):
+            raise InvalidComponent("Model has no linear attention layers")
+
+        if (
+            getattr(hf_config, "linear_num_heads", None) is None
+            or getattr(hf_config, "linear_head_dim", None) is None
+        ):
+            raise InvalidComponent(
+                "Model lacks linear_num_heads/linear_head_dim for KDA metrics"
+            )
+
+        return args
+
+
+class KdaConfigParser(Parser):
+    """
+    Parses KDA (GatedDeltaNet-style linear attention) configuration fields.
+    Provides: linear_num_heads, linear_head_dim, linear_conv_kernel_dim,
+    num_kda_layers, ssm_state_byte_size
+    """
+
+    def parse(self, args: ParsedArgs, vllm_config: VllmConfig) -> ParsedArgs:
+        cfg = vllm_config.model_config.hf_text_config
+        if hasattr(cfg, "text_config") and cfg.text_config is not None:
+            cfg = cfg.text_config
+
+        args.linear_num_heads = get_required(cfg, "linear_num_heads")
+        args.linear_head_dim = get_required(cfg, "linear_head_dim")
+        args.linear_conv_kernel_dim = getattr(cfg, "linear_conv_kernel_dim", 4)
+
+        block_types = cfg.layers_block_type
+        if isinstance(block_types, str):
+            block_types = [block_types]
+        args.num_kda_layers = sum(1 for bt in block_types if bt == "linear_attention")
+
+        args.ssm_state_byte_size = _get_ssm_state_byte_size(vllm_config)
+
+        return args
+
+
+class KdaQuantizationConfigParser(Parser):
+    """
+    Parses quantization configuration for KDA layers.
+    Overrides: weight_byte_size
+    """
+
+    def parse(self, args: ParsedArgs, vllm_config: VllmConfig) -> ParsedArgs:
+        cfg = vllm_config.quant_config
+
+        if cfg is None:
+            return args
+
+        quant_method = cfg.get_name()
+
+        if quant_method == "modelopt_mixed":
+            component_sizes = _compute_modelopt_mixed_component_byte_sizes(
+                cfg, args.weight_byte_size
+            )
+            args.weight_byte_size = component_sizes.get("mamba", args.weight_byte_size)
+        elif quant_method == "compressed-tensors":
+            args.weight_byte_size = _resolve_compressed_tensors_byte_size(
+                cfg, "kda", args.weight_byte_size
+            )
+        elif quant_method in _QUANT_WEIGHT_BYTE_SIZE:
+            args.weight_byte_size = _QUANT_WEIGHT_BYTE_SIZE[quant_method]
+
+        return args
+
+
+class KdaMetrics(ComponentMetrics):
+    """
+    Performance metrics for KDA (GatedDeltaNet-style linear attention) layers,
+    e.g. the 34 linear_attention layers of GLM-5.3-Flash.
+
+    Per layer (nh = linear_num_heads, hd = linear_head_dim, D = hidden_size):
+    - in_proj: merged q/k/v/b/f_a/g_a projection, out-dim
+      3*nh*hd + nh + 2*hd (f_a/g_a are TP-replicated; the replicated fraction
+      is small and is counted as sharded here)
+    - f_b/g_b: hd -> nh*hd each
+    - conv1d: short causal conv over the qkv channels (3*nh*hd), kernel K
+    - GDN state update: per-head (hd, hd) state, ~6 flops per state element
+    - out_proj: nh*hd -> D
+    """
+
+    # From BaseConfigParser
+    hidden_size: int = Field(..., gt=0)
+    activation_byte_size: int = Field(..., gt=0)
+    tp_size: int = Field(..., gt=0)
+    pp_size: int = Field(..., gt=0)
+
+    # From BaseConfigParser, can be overridden by KdaQuantizationConfigParser
+    weight_byte_size: int | float = Field(..., gt=0)
+
+    # From KdaConfigParser
+    num_kda_layers: int = Field(..., gt=0)
+    linear_num_heads: int = Field(..., gt=0)
+    linear_head_dim: int = Field(..., gt=0)
+    linear_conv_kernel_dim: int = Field(..., gt=0)
+    ssm_state_byte_size: int | float = Field(..., gt=0)
+
+    @classmethod
+    def component_type(cls) -> str:
+        return "kda"
+
+    @classmethod
+    def get_parser(cls) -> ParserChain:
+        return ParserChain(
+            BaseConfigParser(),
+            KdaDetectionParser(),
+            KdaConfigParser(),
+            KdaQuantizationConfigParser(),
+        )
+
+    def _dims(self, per_gpu: bool) -> tuple[int, int, int, int, int]:
+        L = self.num_kda_layers
+        D = self.hidden_size
+        nh = self.linear_num_heads
+        hd = self.linear_head_dim
+        K = self.linear_conv_kernel_dim
+
+        if per_gpu:
+            L //= self.pp_size
+            nh = max(1, nh // self.tp_size)
+
+        return L, D, nh, hd, K
+
+    def get_num_flops_breakdown(
+        self, ctx: ExecutionContext, per_gpu: bool = True
+    ) -> dict[str, int]:
+        """Calculate flops breakdown for KDA layers."""
+        L, D, nh, hd, K = self._dims(per_gpu)
+        T = ctx.total_num_tokens()
+
+        in_proj_out = 3 * nh * hd + nh + 2 * hd
+        conv_dim = 3 * nh * hd
+
+        return {
+            "kda_in_proj": 2 * T * D * in_proj_out * L,
+            "kda_fg_b_proj": 2 * 2 * T * hd * (nh * hd) * L,
+            "kda_conv1d": 2 * T * conv_dim * K * L,
+            "kda_gdn_state": 6 * T * nh * hd * hd * L,
+            "kda_out_proj": 2 * T * (nh * hd) * D * L,
+        }
+
+    def get_read_bytes_breakdown(
+        self, ctx: ExecutionContext, per_gpu: bool = True
+    ) -> dict[str, int]:
+        """Calculate read memory traffic for KDA layers."""
+        L, D, nh, hd, K = self._dims(per_gpu)
+        T = ctx.total_num_tokens()
+
+        in_proj_out = 3 * nh * hd + nh + 2 * hd
+        conv_dim = 3 * nh * hd
+        wbs = self.weight_byte_size
+        act = self.activation_byte_size
+
+        return {
+            "kda_in_proj_weight": int(D * in_proj_out * wbs * L),
+            "kda_in_proj_input": T * D * act * L,
+            "kda_fg_b_weight": int(2 * hd * (nh * hd) * wbs * L),
+            "kda_fg_b_input": T * 2 * hd * act * L,
+            "kda_conv_weight": int(conv_dim * K * wbs * L),
+            "kda_conv_input": T * conv_dim * act * L,
+            "kda_state_read": int(T * nh * hd * hd * self.ssm_state_byte_size * L),
+            "kda_out_proj_weight": int((nh * hd) * D * wbs * L),
+            "kda_out_proj_input": T * (nh * hd) * act * L,
+        }
+
+    def get_write_bytes_breakdown(
+        self, ctx: ExecutionContext, per_gpu: bool = True
+    ) -> dict[str, int]:
+        """Calculate write memory traffic for KDA layers."""
+        L, D, nh, hd, K = self._dims(per_gpu)
+        T = ctx.total_num_tokens()
+
+        in_proj_out = 3 * nh * hd + nh + 2 * hd
+        conv_dim = 3 * nh * hd
+        act = self.activation_byte_size
+
+        return {
+            "kda_in_proj_output": T * in_proj_out * act * L,
+            "kda_fg_b_output": T * 2 * (nh * hd) * act * L,
+            "kda_conv_output": T * conv_dim * act * L,
+            "kda_state_write": int(T * nh * hd * hd * self.ssm_state_byte_size * L),
+            "kda_out_proj_output": T * D * act * L,
+        }
+
+
 #### ModelMetrics ####
 
 
@@ -1780,6 +2106,12 @@ class ModelMetrics:
         """
 
         self.vllm_config = vllm_config
+        # vLLM v1 disables chunked prefill when spec decode is enabled, so a
+        # multi-token step for a cached request is then always a verify
+        # (decode) step rather than a prefill chunk.
+        self.spec_decoding_enabled = (
+            getattr(vllm_config, "speculative_config", None) is not None
+        )
 
         self.metrics: list[ComponentMetrics] = []
         for metric_cls in ComponentMetrics.registered_metrics():
@@ -1879,8 +2211,10 @@ class ModelMetrics:
             context_len = num_computed_tokens + num_tokens
 
             # Cached requests are typically in decode phase (num_tokens == 1)
-            # unless they're doing chunked prefill (num_tokens > 1)
-            is_prefill = num_tokens > 1
+            # unless they're doing chunked prefill (num_tokens > 1). With
+            # spec decode, chunked prefill is disabled and multi-token cached
+            # steps are verify (decode) steps.
+            is_prefill = num_tokens > 1 and not self.spec_decoding_enabled
             ctx.add(num_tokens, context_len, is_prefill)
 
         num_flops_breakdown = self.get_num_flops_breakdown(ctx, True)
