@@ -216,12 +216,12 @@ def test_drafter_exact_fit_slot_shares_mla_page():
 def test_drafter_standalone_when_page_does_not_fit():
     """A drafter whose page cannot cleanly fill the MLA page keeps its real
     spec and gets compact per-layer tensors charged per block."""
-    # head_size 1152 x 2 (K+V) x bf16 -> 4608 B/token -> fit_block 288, whose
-    # % 64 != 0 fails the exact-fit conditions -> STANDALONE.
+    # head_size 1000 x 2 (K+V) x bf16 -> 4000 B/token; MLA page 1327104 is not
+    # divisible by 4000, so fit_block=0 (no exact fit) -> STANDALONE.
     drafter = SlidingWindowSpec(
         block_size=BLOCK_SIZE,
         num_kv_heads=1,
-        head_size=1152,
+        head_size=1000,
         dtype=torch.bfloat16,
         sliding_window=64,
     )
@@ -241,35 +241,53 @@ def test_drafter_standalone_when_page_does_not_fit():
     assert all(s.page_size_bytes != mla_page_built for s in inner.values())
 
 
-def test_drafter_tp1_quadrupled_page_goes_standalone():
-    """A draft_tensor_parallel_size=1 drafter holds all KV heads on every
-    rank, quadrupling per-token bytes vs the TP4-sharded drafter. The builder
-    must still accept it — the quadrupled page no longer exact-fits the MLA
-    page, so it lands on the standalone branch."""
-    # TP4-sharded exact-fit geometry: 1 x 288 x 2 x bf16 = 1152 B/token.
-    # TP1 replicated: 4x heads -> 4608 B/token -> fit_block 288, whose
-    # % 64 != 0 fails the exact-fit conditions -> STANDALONE.
+def test_drafter_tp1_quadrupled_page_exact_fits_mla_page():
+    """A draft_tensor_parallel_size=1 drafter holds all 8 KV heads on every
+    rank, quadrupling per-token bytes vs the TP4-sharded drafter. Its real
+    page must still exact-fit the MLA page so it slot-shares (no standalone
+    pool collapse): regression guard for the 1.74M->534K token drop."""
+    # Real DFlash2 geometry: 8 KV heads x 128 head_dim x bf16 -> 4096 B/token.
+    # The TP1 fit_block is NOT 64-divisible on its own (2304-token MLA page //
+    # 4096 B/token), but the common block lcm(mla_block, fit_block) is, so the
+    # drafter must EXACT-FIT (slot-share), not fall to standalone tensors.
     drafter = SlidingWindowSpec(
         block_size=BLOCK_SIZE,
-        num_kv_heads=4,
-        head_size=288,
+        num_kv_heads=8,
+        head_size=128,
         dtype=torch.bfloat16,
-        sliding_window=64,
+        sliding_window=2048,
     )
     specs = _glm5_specs()
     specs["d.draft"] = drafter
+
+    mla_page = next(
+        iter(
+            cast_spec(
+                try_build_kv_cache_groups(_vllm_config(), _glm5_specs())[0]
+            ).kv_cache_specs.values()
+        )
+    ).page_size_bytes
+    draft_bpt = drafter.page_size_bytes // drafter.block_size
+    fit_block = mla_page // draft_bpt
+    # The pre-fix gate rejected TP1 (fit_block not 64-divisible) -> standalone.
+    from math import gcd
+
+    common_block = BLOCK_SIZE * fit_block // gcd(BLOCK_SIZE, fit_block)
+    assert common_block % 64 == 0
 
     groups = try_build_kv_cache_groups(_vllm_config(), specs)
     assert groups is not None
     draft_group = groups[-1]
     assert isinstance(draft_group.kv_cache_spec, UniformTypeKVCacheSpecs)
     inner = draft_group.kv_cache_spec.kv_cache_specs
-    assert all(s.block_size == BLOCK_SIZE for s in inner.values())
+    # EXACT FIT: drafter block_size is rewritten to fit_block and its page
+    # becomes the MLA page (slot-shared, no added per-block bytes).
+    assert all(s.block_size == fit_block for s in inner.values())
     assert all(s.page_size_padded is None for s in inner.values())
     mla_page_built = next(
         iter(cast_spec(groups[0]).kv_cache_specs.values())
     ).page_size_bytes
-    assert all(s.page_size_bytes != mla_page_built for s in inner.values())
+    assert all(s.page_size_bytes == mla_page_built for s in inner.values())
 
 
 def test_drafter_group_appended_last_keeps_group_ids_stable():

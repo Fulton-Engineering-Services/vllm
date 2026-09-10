@@ -428,6 +428,47 @@ def test_lane_admission_fits_pin(glm5_lane):
     )
 
 
+def test_lane_tp1_drafter_serves_1m_tokens():
+    """A draft_tensor_parallel_size=1 drafter (8 KV heads, not the TP4-sharded
+    2) must still slot-share the MLA page and serve >1M tokens.
+
+    Regression guard for the live 1.74M->534K pool collapse: the TP1 drafter's
+    fit_block is not 64-divisible on its own, so the pre-fix exact-fit gate
+    rejected it and the drafter fell to standalone tensors whose page
+    unification shrank the pool ~3.3x. The common-block LCM (2304) is
+    64-divisible, so it must EXACT-FIT."""
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+    from vllm.v1.glm5next.kv_groups import (
+        try_build_kv_cache_groups as _get_kv_cache_groups_glm5_next,
+    )
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    vllm_config = _vllm_config()
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    with set_current_vllm_config(vllm_config):
+        specs = _build_glm5_specs(vllm_config)
+        # Replace the TP4-sharded drafter (num_kv_heads=2) with the TP1
+        # replicated drafter (num_kv_heads=8, model-wide block_size).
+        specs = {k: v for k, v in specs.items() if not k.startswith("drafter.")}
+        for j in range(5):
+            specs[f"drafter.model.layers.{j}.self_attn"] = SlidingWindowSpec(
+                block_size=BLOCK_SIZE,
+                num_kv_heads=8,
+                head_size=128,
+                dtype=torch.bfloat16,
+                sliding_window=2048,
+            )
+        groups = _get_kv_cache_groups_glm5_next(vllm_config, specs)
+        assert groups is not None
+        cfg = get_kv_cache_config_from_groups(vllm_config, groups, KV_MEMORY_BYTES)
+        tokens = cfg.num_blocks * BLOCK_SIZE
+        print(f"\nTP1 drafter: num_blocks={cfg.num_blocks} tokens={tokens}")
+        assert tokens > 1_000_000, (
+            f"TP1 drafter serves only {tokens} tokens; the drafter must "
+            "slot-share (exact-fit), not collapse the pool"
+        )
+
+
 def test_lane_survives_eagle3_hidden_layers():
     """Regression: the DFlash2 drafter's Eagle3 aux-capture layers are
     HiddenStateCacheSpec. On the first restored lane they fell into attn_specs,

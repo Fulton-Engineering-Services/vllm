@@ -8,6 +8,7 @@ thin hook call site in ``get_kv_cache_groups``. Dispatches on spec shape
 never on ``vllm.models.*`` imports.
 """
 
+import math
 from dataclasses import replace
 from typing import cast
 
@@ -190,15 +191,27 @@ def try_build_kv_cache_groups(
             if mla_page % draft_bytes_per_token == 0
             else 0
         )
+        # The manager block is lcm(mla_block, fit_block); the SWA backends
+        # (MultipleOf(64)/MultipleOf(16)) split that manager block into kernel
+        # blocks. A TP4 drafter (2 KV heads) gives fit_block=1152, a TP1
+        # drafter (8 KV heads) gives fit_block=288 — both have lcm=2304, which
+        # is 64-divisible, so the common split is clean. Gating on fit_block
+        # itself being 64-divisible wrongly rejects the TP1 288 case and drops
+        # the drafter to standalone tensors (page unification collapses the
+        # pool ~3.3x). Gate on the common block instead.
+        common_block = (
+            mla_block * fit_block // math.gcd(mla_block, fit_block) if fit_block else 0
+        )
         if (
             fit_block
-            # A 64-divisible manager block is divisible by every int kernel
-            # block size the SWA backends register, so select_common_block_size
-            # always finds a clean split.
-            and fit_block % 64 == 0
-            # Keep resolve_kv_cache_block_sizes' scheduler LCM at
-            # max(mla_block, fit_block) instead of exploding.
-            and (fit_block % mla_block == 0 or mla_block % fit_block == 0)
+            # select_common_block_size splits the manager block into 64-token
+            # (or 16-token) kernel blocks; require the common block to be
+            # 64-divisible so every SWA kernel block size divides it cleanly.
+            and common_block % 64 == 0
+            # The common block must be an exact multiple of both spans so the
+            # scheduler LCM stays at lcm(mla_block, fit_block) (no explosion).
+            and common_block % fit_block == 0
+            and common_block % mla_block == 0
             and len(draft_specs) <= len(mla_names)
         ):
             # EXACT FIT: drafter layer i co-owns MLA tensor i at disjoint block
