@@ -5,6 +5,7 @@
 import pytest
 
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.glm5next.tail_manager import KpoolTailManager
 
 pytestmark = pytest.mark.cpu_test
@@ -139,3 +140,25 @@ def test_pop_blocks_for_free_resets_frontier():
     assert sum(not b.is_null for b in popped) == 1
     assert "req" not in manager._null_frontier
     assert "req" not in manager.req_to_blocks
+
+
+def test_tail_blocks_are_not_sampled_for_residency_metrics():
+    """Tail blocks recycle every few decode steps; if the metrics collector
+    sampled them, the kv_block_lifetime/idle/reuse histograms would measure
+    ring churn instead of real KV residency."""
+    collector = KVCacheMetricsCollector(sample_rate=1.0)
+    block_pool = BlockPool(
+        num_gpu_blocks=100,
+        enable_caching=False,
+        hash_block_size=BLOCK_SIZE,
+        metrics_collector=collector,
+    )
+    manager = get_tail_manager(block_pool)
+
+    manager.allocate_new_blocks("req", 16384, 16384)
+    manager.allocate_new_blocks("req", 16388, 16384)
+    assert collector.block_metrics == {}
+
+    # Tracked allocations still feed the collector.
+    tracked = block_pool.get_new_blocks(1)[0]
+    assert tracked.block_id in collector.block_metrics

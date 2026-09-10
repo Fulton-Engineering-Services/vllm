@@ -644,13 +644,20 @@ class BlockPool:
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
 
-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+    def get_new_blocks(
+        self, num_blocks: int, *, track_metrics: bool = True
+    ) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
         Note that we do not check block cache in this function.
 
         Args:
             num_blocks: The number of blocks to allocate.
+            track_metrics: Whether the metrics collector should sample these
+                blocks for residency tracking. Scratch/ring-buffer users
+                (e.g. the GLM-5.3 kpool tail, which recycles blocks every
+                decode step) pass False so their churn does not pollute the
+                kv_block_lifetime/idle/reuse histograms.
 
         Returns:
             A list of new block.
@@ -666,13 +673,13 @@ class BlockPool:
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
-                if self.metrics_collector:
+                if track_metrics and self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
-                if self.metrics_collector:
+                if track_metrics and self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
 

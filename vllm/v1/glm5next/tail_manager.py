@@ -80,7 +80,7 @@ class KpoolTailManager(SlidingWindowManager):
             # Partial hit: redirect the shared tail to a private CoW block,
             # as in the base class.
             block_idx, source_block = self._partial_hit_reqs.pop(request_id)
-            cow_block = self.block_pool.get_new_blocks(1)[0]
+            cow_block = self.block_pool.get_new_blocks(1, track_metrics=False)[0]
             self._apply_cow(request_id, block_idx, source_block, cow_block)
             self.new_block_ids.append(cow_block.block_id)
             cow_blocks.append(cow_block)
@@ -96,7 +96,9 @@ class KpoolTailManager(SlidingWindowManager):
         num_real = required - pad_end
         if num_real <= 0:
             return cow_blocks
-        new_blocks = self.block_pool.get_new_blocks(num_real)
+        # The tail is a ring buffer: real blocks are retired and re-allocated
+        # every few decode steps, so residency metrics must not sample them.
+        new_blocks = self.block_pool.get_new_blocks(num_real, track_metrics=False)
         req_blocks.extend(new_blocks)
         if self._record_new_block_ids:
             self.new_block_ids.extend(b.block_id for b in new_blocks)
