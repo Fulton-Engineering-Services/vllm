@@ -66,7 +66,8 @@ def test_b12x_auto_engaged(monkeypatch):
     monkeypatch.setenv("VLLM_B12X_MOE_FP4_AUTO", "1")
 
     experts = B12xExperts(_dummy_moe_config(), _nvfp4_quant_config())
-    assert experts._quant_mode == "nvfp4_auto"
+    assert experts._quant_mode == "nvfp4"
+    assert experts._effective_quant_mode == "nvfp4_auto"
     assert experts._source_format == "modelopt_nvfp4"
 
 

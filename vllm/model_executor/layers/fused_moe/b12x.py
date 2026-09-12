@@ -223,18 +223,22 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             raise ValueError(
                 f"unsupported b12x MoE quantization scheme {scheme}"
             ) from exc
+        self._prepared_experts: Any | None = None
+        self._source_parameters_released = False
+        self._unit_scales: dict[torch.device, torch.Tensor] = {}
+        self._plans: dict[tuple[int, int, MoEActivation, bool], Any] = {}
+        self._apply_router_weight_on_input = False
+
+    @property
+    def _effective_quant_mode(self) -> str:
         import os
 
         if (
             self._quant_mode == "nvfp4"
             and os.environ.get("VLLM_B12X_MOE_FP4_AUTO", "0") == "1"
         ):
-            self._quant_mode = "nvfp4_auto"
-        self._prepared_experts: Any | None = None
-        self._source_parameters_released = False
-        self._unit_scales: dict[torch.device, torch.Tensor] = {}
-        self._plans: dict[tuple[int, int, MoEActivation, bool], Any] = {}
-        self._apply_router_weight_on_input = False
+            return "nvfp4_auto"
+        return self._quant_mode
 
     def _unit_scale(self, device: torch.device, num_experts: int) -> torch.Tensor:
         scale = self._unit_scales.get(device)
@@ -581,8 +585,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 weight_plan=prepared.plan,
                 core_token_counts=(key[0],),
                 route_num_experts=0,
-                quant_mode=self._quant_mode,
-                apply_router_weight_on_input=key[3],
+                quant_mode=self._effective_quant_mode,
                 swiglu_limit=limit,
                 swiglu_alpha=alpha,
                 swiglu_beta=beta,
@@ -612,8 +615,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 type(self),
                 prepared.w1_fp4.device,
                 output_dtype,
-                self._quant_mode,
-                self._source_format,
+                self._effective_quant_mode,
                 self._w13_layout,
                 int(prepared.num_experts),
                 int(prepared.hidden_size),
@@ -649,8 +651,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 tokens=tokens,
                 topk=topk,
                 prepared=prepared,
-                quant_mode=self._quant_mode,
-                apply_router_weight_on_input=apply_router_weight_on_input,
+                quant_mode=self._effective_quant_mode,
                 swiglu_limit=limit,
                 swiglu_alpha=alpha,
                 swiglu_beta=beta,
@@ -697,7 +698,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 output=output,
-                unit_scale_contract=self._quant_mode == "w4a16",
+unit_scale_contract=self._effective_quant_mode == "w4a16",
             )
         return len(launch_tokens)
 
@@ -770,7 +771,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             output=output,
-            unit_scale_contract=self._quant_mode == "w4a16",
+            unit_scale_contract=self._effective_quant_mode == "w4a16",
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
