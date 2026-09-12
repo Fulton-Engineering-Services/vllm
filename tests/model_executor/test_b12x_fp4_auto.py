@@ -51,23 +51,9 @@ def test_b12x_auto_disabled_by_default(monkeypatch):
     monkeypatch.setattr(
         B12xExperts, "process_weights_after_loading", lambda self, layer: None
     )
-    monkeypatch.delenv("VLLM_B12X_MOE_FP4_AUTO", raising=False)
 
     experts = B12xExperts(_dummy_moe_config(), _nvfp4_quant_config())
     assert experts._quant_mode == "nvfp4"
-    assert experts._source_format == "modelopt_nvfp4"
-
-
-def test_b12x_auto_engaged(monkeypatch):
-    monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
-    monkeypatch.setattr(
-        B12xExperts, "process_weights_after_loading", lambda self, layer: None
-    )
-    monkeypatch.setenv("VLLM_B12X_MOE_FP4_AUTO", "1")
-
-    experts = B12xExperts(_dummy_moe_config(), _nvfp4_quant_config())
-    assert experts._quant_mode == "nvfp4"
-    assert experts._effective_quant_mode == "nvfp4_auto"
     assert experts._source_format == "modelopt_nvfp4"
 
 
@@ -76,7 +62,6 @@ def test_b12x_auto_does_not_affect_w4a16(monkeypatch):
     monkeypatch.setattr(
         B12xExperts, "process_weights_after_loading", lambda self, layer: None
     )
-    monkeypatch.setenv("VLLM_B12X_MOE_FP4_AUTO", "1")
 
     experts = B12xExperts(_dummy_moe_config(), _nvfp4_quant_config(None))
     assert experts._quant_mode == "w4a16"

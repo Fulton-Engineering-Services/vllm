@@ -231,13 +231,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 
     @property
     def _effective_quant_mode(self) -> str:
-        import os
-
-        if (
-            self._quant_mode == "nvfp4"
-            and os.environ.get("VLLM_B12X_MOE_FP4_AUTO", "0") == "1"
-        ):
-            return "nvfp4_auto"
         return self._quant_mode
 
     def _unit_scale(self, device: torch.device, num_experts: int) -> torch.Tensor:
