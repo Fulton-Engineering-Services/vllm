@@ -223,6 +223,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             raise ValueError(
                 f"unsupported b12x MoE quantization scheme {scheme}"
             ) from exc
+        import os
+
+        if (
+            self._quant_mode == "nvfp4"
+            and os.environ.get("VLLM_B12X_MOE_FP4_AUTO", "0") == "1"
+        ):
+            self._quant_mode = "nvfp4_auto"
         self._prepared_experts: Any | None = None
         self._source_parameters_released = False
         self._unit_scales: dict[torch.device, torch.Tensor] = {}
